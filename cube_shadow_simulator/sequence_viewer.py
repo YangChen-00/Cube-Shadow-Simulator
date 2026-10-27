@@ -27,7 +27,7 @@ class DualArmSequenceViewer:
         if not runs:
             raise ValueError("At least one sequence run is required")
         try:
-            from curobo.types import ContentPath, JointState
+            from curobo.types import ContentPath
             from curobo.viewer import ViserVisualizer
             from viser.extras import ViserUrdf
         except ImportError as exc:
@@ -37,7 +37,6 @@ class DualArmSequenceViewer:
         self.runs = runs
         self.config = runs[0].config
         self.output_dir = Path(output_dir).expanduser().resolve()
-        self.JointState = JointState
         self.visualizer = ViserVisualizer(
             content_path=ContentPath(robot_config_file=self.config.robot_yaml),
             connect_ip=self.config.viser_host,
@@ -48,9 +47,10 @@ class DualArmSequenceViewer:
         )
         self.server = self.visualizer._server
         # ViserVisualizer currently constructs one root URDF even when
-        # add_robot_to_scene=False. Remove that instance before adding the two
-        # calibrated copies below.
-        self.visualizer._viser_urdf.remove()
+        # add_robot_to_scene=False. Hide it instead of recursively removing it;
+        # some Viser versions warn once per child during recursive removal.
+        self.visualizer._viser_urdf.show_visual = False
+        self._cache_viser_joint_defaults()
         self._playing = False
         self._recording = False
         self._stop = False
@@ -220,19 +220,45 @@ class DualArmSequenceViewer:
         self.play_button.disabled = disabled
         self.record_button.disabled = disabled
 
-    def _joint_state(self, q: np.ndarray, joint_names):
-        tensor = self.engine.torch.as_tensor(
-            q, device="cuda", dtype=self.engine.torch.float32
-        ).unsqueeze(0)
-        return self.JointState.from_position(tensor, joint_names=joint_names)
+    def _cache_viser_joint_defaults(self) -> None:
+        """Cache a complete display configuration, including locked joints."""
+        kinematics = self.visualizer._kinematics
+        full_default = kinematics.get_full_js(
+            kinematics.default_joint_state.clone()
+        )
+        self._viser_joint_names = tuple(self.visualizer._viser_joint_names)
+        self._viser_joint_indices = {
+            name: index for index, name in enumerate(self._viser_joint_names)
+        }
+        full_default.reindex(self._viser_joint_names)
+        self._viser_default_positions = (
+            full_default.position.detach().cpu().numpy().reshape(-1).copy()
+        )
+
+        if self._viser_default_positions.size != len(self._viser_joint_names):
+            raise RuntimeError(
+                "Viser robot model returned an inconsistent default joint state"
+            )
 
     def _set_robot(self, arm: str, q: np.ndarray, joint_names) -> None:
-        joint_state = self._joint_state(q, joint_names).squeeze(0)
-        viser_names = self.visualizer._viser_joint_names
-        if set(viser_names) != set(joint_state.joint_names):
-            joint_state = self.visualizer._kinematics.get_full_js(joint_state)
-        joint_state.reindex(viser_names)
-        self.arm_urdfs[arm].update_cfg(joint_state.position.cpu().squeeze().numpy())
+        names = tuple(joint_names)
+        values = np.asarray(q, dtype=float).reshape(-1)
+        if values.size != len(names):
+            raise ValueError(
+                f"Trajectory has {values.size} values for {len(names)} joint names"
+            )
+
+        # A saved trajectory may contain some (but not all) locked joints. Calling
+        # cuRobo get_full_js() on that mixed state raises because it tries to add
+        # those joints a second time. Merge by name into a known-complete default
+        # configuration instead; absent locked joints retain their URDF defaults.
+        position = self._viser_default_positions.copy()
+        unknown = [name for name in names if name not in self._viser_joint_indices]
+        if unknown:
+            raise ValueError(f"Trajectory contains joints absent from Viser: {unknown}")
+        for name, value in zip(names, values):
+            position[self._viser_joint_indices[name]] = value
+        self.arm_urdfs[arm].update_cfg(position)
 
     def _tool_matrix(self, q: np.ndarray, joint_names) -> np.ndarray:
         plan_state = self.engine.joint_state_from_waypoint(q, list(joint_names))
@@ -463,9 +489,6 @@ class DualArmSequenceViewer:
             self._set_controls_disabled(False)
 
     def serve_forever(self) -> None:
-        print(
-            f"Dual-arm U-S-T Viser is serving on "
-            f"http://{self.config.viser_host}:{self.config.viser_port}"
-        )
+        print("Dual-arm U-S-T Viser is ready; use the HTTP address in the Viser banner above.")
         while True:
             time.sleep(10.0)

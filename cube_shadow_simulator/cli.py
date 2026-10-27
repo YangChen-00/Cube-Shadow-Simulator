@@ -130,7 +130,7 @@ def _run_sequence(args) -> int:
         raise ValueError("--letter-spacing must be greater than zero")
 
     labels = ("U", "S", "T")
-    arms = ("left", "right", "left")
+    arms = ("left", "right", "right")
     offsets = (-args.letter_spacing, 0.0, args.letter_spacing)
     output = Path(args.output).expanduser().resolve()
     combined_bounds = (
@@ -214,7 +214,7 @@ def _run_sequence(args) -> int:
     sequence_summary = {
         "schema_version": "1.0",
         "sequence": "U -> S -> T",
-        "arm_assignment": {"U": "left", "S": "right", "T": "left"},
+        "arm_assignment": {"U": "left", "S": "right", "T": "right"},
         "execution": "strictly serialized",
         "arm_separation_m": args.arm_separation,
         "letter_spacing_mm": args.letter_spacing,

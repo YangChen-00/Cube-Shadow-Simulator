@@ -28,7 +28,7 @@ class AssemblyViewer:
         output_dir: Optional[str | Path] = None,
     ):
         try:
-            from curobo.types import ContentPath, JointState
+            from curobo.types import ContentPath
             from curobo.viewer import ViserVisualizer
         except ImportError as exc:
             raise RuntimeError("cuRoboV2 Viser support is unavailable on this server") from exc
@@ -37,7 +37,6 @@ class AssemblyViewer:
         self.layout = layout
         self.config = config
         self.output_dir = Path(output_dir or "runs/latest").expanduser().resolve()
-        self.JointState = JointState
         self.visualizer = ViserVisualizer(
             content_path=ContentPath(robot_config_file=config.robot_yaml),
             connect_ip=config.viser_host,
@@ -45,6 +44,7 @@ class AssemblyViewer:
             add_control_frames=False,
             visualize_robot_spheres=False,
         )
+        self._cache_viser_joint_defaults()
         self.server = self.visualizer._server
         self.obstacle_handles = self._add_scene_boxes()
         self._playing = False
@@ -169,16 +169,43 @@ class AssemblyViewer:
                 image = np.asarray(Image.open(path).convert("RGB"))
                 self.server.gui.add_image(image, label="目标阴影", format="png")
 
-    def _joint_state(self, q: np.ndarray, joint_names):
-        tensor = self.engine.torch.as_tensor(
-            q, device="cuda", dtype=self.engine.torch.float32
-        ).unsqueeze(0)
-        return self.JointState.from_position(
-            tensor, joint_names=joint_names
+    def _cache_viser_joint_defaults(self) -> None:
+        """Cache a complete display configuration, including locked joints."""
+        kinematics = self.visualizer._kinematics
+        full_default = kinematics.get_full_js(
+            kinematics.default_joint_state.clone()
+        )
+        self._viser_joint_names = tuple(self.visualizer._viser_joint_names)
+        self._viser_joint_indices = {
+            name: index for index, name in enumerate(self._viser_joint_names)
+        }
+        full_default.reindex(self._viser_joint_names)
+        self._viser_default_positions = (
+            full_default.position.detach().cpu().numpy().reshape(-1).copy()
         )
 
+        if self._viser_default_positions.size != len(self._viser_joint_names):
+            raise RuntimeError(
+                "Viser robot model returned an inconsistent default joint state"
+            )
+
     def _set_robot(self, q: np.ndarray, joint_names) -> None:
-        self.visualizer.set_joint_state(self._joint_state(q, joint_names).squeeze(0))
+        names = tuple(joint_names)
+        values = np.asarray(q, dtype=float).reshape(-1)
+        if values.size != len(names):
+            raise ValueError(
+                f"Trajectory has {values.size} values for {len(names)} joint names"
+            )
+
+        # Avoid ViserVisualizer.set_joint_state() here: its get_full_js() path
+        # cannot accept a trajectory that already contains only some lock joints.
+        position = self._viser_default_positions.copy()
+        unknown = [name for name in names if name not in self._viser_joint_indices]
+        if unknown:
+            raise ValueError(f"Trajectory contains joints absent from Viser: {unknown}")
+        for name, value in zip(names, values):
+            position[self._viser_joint_indices[name]] = value
+        self.visualizer._viser_urdf.update_cfg(position)
 
     def _tool_matrix(self, q: np.ndarray, joint_names) -> np.ndarray:
         plan_state = self.engine.joint_state_from_waypoint(q, list(joint_names))
@@ -431,8 +458,8 @@ class AssemblyViewer:
 
     def serve_forever(self) -> None:
         print(
-            f"Viser is serving on http://{self.config.viser_host}:{self.config.viser_port} "
-            "(use SSH port forwarding when running remotely)."
+            "Viser is ready; use the HTTP address in the Viser banner above "
+            "(and forward that actual port over SSH when running remotely)."
         )
         while True:
             time.sleep(10.0)

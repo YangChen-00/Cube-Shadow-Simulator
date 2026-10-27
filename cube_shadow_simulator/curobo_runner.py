@@ -506,7 +506,7 @@ class CuroboAssemblyPlanner:
         notes = [
             "Approach and pick use cuRoboV2 plan_grasp; lift, transfer, place, and retreat use plan_pose.",
             "Source-table contact is allowed only for a low pick retry and the initial lift; target supports are allowed only during placement.",
-            "Previously placed cubes in exact side contact are allowed only during the final placement descent.",
+            "Previously placed, non-overlapping same-layer neighbours inside the conservative attached-sphere overhang are relaxed only during the final placement descent.",
             "A placed cube becomes a collision obstacle immediately after the gripper retreat.",
             "The carried cube is represented by four conservative attached collision spheres.",
         ]

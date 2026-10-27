@@ -1,5 +1,6 @@
 """Deterministic task-level pick/place phases passed to cuRobo."""
 
+import math
 from dataclasses import dataclass
 from typing import List
 
@@ -46,7 +47,16 @@ def make_tasks(layout: Layout, cfg: WorkcellConfig) -> List[CubeTask]:
         source = source_pose(index, side, cfg)
         target = cube.pose
         place_contacts = list(cube.contacts_below) or ["table"]
-        lateral_tolerance_mm = max(1.0, side * 0.025)
+        # Four spheres conservatively enclose the carried cube. Their XY
+        # envelope extends beyond the exact square by this amount, so a real
+        # non-overlapping neighbour can otherwise make the final vertical
+        # descent report a false attached-object collision.
+        sphere_overhang_mm = (math.sqrt(6.0) - 1.0) * side / 4.0
+        activation_margin_mm = cfg.collision_activation_distance_m * 1000.0
+        lateral_tolerance_mm = max(
+            1.0,
+            sphere_overhang_mm + activation_margin_mm,
+        )
         for previous in layout.placements[:index]:
             vertical_overlap = side - abs(target.z - previous.pose.z)
             if (

@@ -41,14 +41,14 @@ def arm_config(
 ) -> WorkcellConfig:
     """Return a calibrated parallel-arm transform derived from one workcell.
 
-    The two bases are translated along the tabletop Y axis. Their orientation
+    The two bases are translated along the tabletop X axis. Their orientation
     and all robot-specific calibration values remain unchanged. Each arm gets
     a feeder directly in front of its own base.
     """
     if arm not in {"left", "right"}:
         raise ValueError("arm must be 'left' or 'right'")
-    base_y_tabletop = (-0.5 if arm == "left" else 0.5) * separation_m
-    delta_tabletop = np.asarray([0.0, base_y_tabletop, 0.0], dtype=float)
+    base_x_tabletop = (-0.5 if arm == "left" else 0.5) * separation_m
+    delta_tabletop = np.asarray([base_x_tabletop, 0.0, 0.0], dtype=float)
     rotation = quaternion_matrix(base.tabletop_quaternion_wxyz)
     translated = np.asarray(base.tabletop_translation_m) - rotation @ delta_tabletop
     source_x, source_y, source_z = base.source_origin_mm
@@ -56,8 +56,8 @@ def arm_config(
         base,
         tabletop_translation_m=tuple(float(v) for v in translated),
         source_origin_mm=(
-            source_x,
-            source_y + base_y_tabletop * 1000.0,
+            source_x + base_x_tabletop * 1000.0,
+            source_y,
             source_z,
         ),
     )
