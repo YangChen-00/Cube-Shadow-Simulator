@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -13,10 +12,11 @@ import numpy as np
 from .curobo_runner import CuroboAssemblyPlanner
 from .sequence import SequenceRun, base_pose_in_tabletop
 from .transforms import matrix, matrix_pose, yaw_quaternion
+from .viser_app import EXPORT_CAPTURE_FPS, EXPORT_OUTPUT_FPS, export_capture_steps
 
 
 class DualArmSequenceViewer:
-    """Render two fixed-base arms while executing U, S, and T serially."""
+    """Render two fixed-base arms while U and T run together, then S."""
 
     def __init__(
         self,
@@ -93,6 +93,10 @@ class DualArmSequenceViewer:
         ]
         all_x.extend(task.source.x for run in self.runs for task in run.plan.tasks)
         all_y.extend(task.source.y for run in self.runs for task in run.plan.tasks)
+        for run in self.runs:
+            base_position, _ = base_pose_in_tabletop(run.config)
+            all_x.append(float(base_position[0]) * 1000.0)
+            all_y.append(float(base_position[1]) * 1000.0)
         margin = config.table_margin_m
         x0 = min(all_x) / 1000.0 - margin
         x1 = max(all_x) / 1000.0 + margin
@@ -165,16 +169,21 @@ class DualArmSequenceViewer:
     def _add_gui(self) -> None:
         labels = " → ".join(run.label for run in self.runs)
         self.status = self.server.gui.add_markdown(
-            f"## Dual-arm Cube Shadow\n顺序：**{labels}**\n\n等待播放。"
+            f"## Dual-arm Cube Shadow\n左右协同：**{labels}**\n\n"
+            "U 与 T 同时装配，完成后装配 S。"
         )
         self.speed = self.server.gui.add_slider(
             "播放速度", min=0.25, max=4.0, step=0.25, initial_value=1.0
         )
-        self.play_button = self.server.gui.add_button("播放 U → S → T 双臂装配")
+        self.play_button = self.server.gui.add_button("播放左右协同装配")
         reset = self.server.gui.add_button("重置")
         self.server.gui.add_markdown("### 视频导出")
         self.export_speed = self.server.gui.add_slider(
             "下载视频速度", min=0.25, max=4.0, step=0.25, initial_value=1.0
+        )
+        self.server.gui.add_markdown(
+            "这个滑块只改变成片播放速度。导出时每秒成片抓取 10 帧，"
+            "再重复写成 30 FPS，所以导出更快，成片时长不变。"
         )
         self.export_resolution = self.server.gui.add_dropdown(
             "视频清晰度",
@@ -296,8 +305,8 @@ class DualArmSequenceViewer:
                 self._set_cube(run, task.cube_id, self._pose_in_tabletop(task.source))
                 self.cube_handles[(run.label, task.cube_id)].visible = False
         self.status.content = (
-            "## Dual-arm Cube Shadow\n两台机械臂已就位。\n\n"
-            "点击“播放 U → S → T 双臂装配”。"
+            "## Dual-arm Cube Shadow\n左右机械臂已就位。\n\n"
+            "点击“播放左右协同装配”。U 与 T 会同时进行，然后装配 S。"
         )
 
     def _activate_run(self, run: SequenceRun) -> None:
@@ -322,72 +331,104 @@ class DualArmSequenceViewer:
         task = next(task for task in run.plan.tasks if task.cube_id == cube_id)
         self._set_cube(run, cube_id, self._pose_in_tabletop(task.target))
 
+    def _stages(self) -> list[list[SequenceRun]]:
+        stages: list[list[SequenceRun]] = []
+        for run in self.runs:
+            if stages and stages[-1][0].stage == run.stage:
+                stages[-1].append(run)
+            else:
+                stages.append([run])
+        return stages
+
+    def _run_events(self, run: SequenceRun):
+        events = []
+        stamp = 0.0
+        fallback = 1.0 / self.config.playback_hz
+        for phase in run.plan.phases:
+            dt = float(phase.dt) if float(phase.dt) > 0.0 else fallback
+            for index, q in enumerate(phase.joint_positions):
+                if index == 0 and phase.name == "pre_pick":
+                    events.append((stamp, 0, "show", run, phase, None))
+                events.append((stamp, 1, "q", run, phase, q))
+                stamp += dt
+            if phase.name == "place":
+                # Same timestamp as the next phase. Priority 0 snaps the cube
+                # down before that phase's first waypoint is applied.
+                events.append((stamp, 0, "place", run, phase, None))
+        return events
+
+    def _stage_frames(self, runs: list[SequenceRun]):
+        grouped: dict[float, list] = {}
+        for run in runs:
+            for event in self._run_events(run):
+                grouped.setdefault(event[0], []).append(event)
+        times = sorted(grouped)
+        frames = []
+        for index, stamp in enumerate(times):
+            nxt = times[index + 1] if index + 1 < len(times) else stamp
+            actions = sorted(grouped[stamp], key=lambda item: item[1])
+            frames.append((stamp, actions, nxt - stamp))
+        return frames
+
+    def _playback_frames(self):
+        frames = []
+        origin = 0.0
+        for runs in self._stages():
+            stage_frames = self._stage_frames(runs)
+            if not stage_frames:
+                frames.append((origin, runs, [], 0.0, True))
+                continue
+            for index, (stamp, actions, dt) in enumerate(stage_frames):
+                frames.append((origin + stamp, runs, actions, dt, index == 0))
+            origin += stage_frames[-1][0] + 1e-3
+        if frames:
+            end_time = frames[-1][0]
+            frames.append((end_time, [], [], 0.0, False))
+        return frames
+
+    def _apply_event(self, kind: str, run: SequenceRun, phase, q) -> None:
+        if kind == "show":
+            self.cube_handles[(run.label, phase.cube_id)].visible = True
+        elif kind == "q":
+            self._apply_waypoint(run, phase, q)
+        elif kind == "place":
+            self._finish_place(run, phase.cube_id)
+
     def _play(self) -> None:
         self._stop = False
         self._reset_scene()
-        total_phases = sum(len(run.plan.phases) for run in self.runs)
-        phase_counter = 0
+        frames = self._playback_frames()
         try:
-            for run_index, run in enumerate(self.runs, 1):
+            for index, (_, runs, actions, _, stage_start) in enumerate(frames):
                 if self._stop:
                     return
-                self._activate_run(run)
-                for phase in run.plan.phases:
-                    phase_counter += 1
-                    if phase.name == "pre_pick":
-                        self.cube_handles[(run.label, phase.cube_id)].visible = True
+                if stage_start:
+                    for run in runs:
+                        self._activate_run(run)
+                if not actions:
+                    continue
+                moving = [item for item in actions if item[2] == "q"]
+                if moving:
+                    _, _, _, run, phase, _ = moving[-1]
                     self.status.content = (
-                        f"## Dual-arm Cube Shadow\n**{run.label} · {run.arm} arm** "
-                        f"`{run_index}/{len(self.runs)}`\n\n"
-                        f"轨迹 `{phase_counter}/{total_phases}`："
-                        f"`{phase.cube_id} · {phase.name}`"
+                        "## Dual-arm Cube Shadow\n"
+                        f"**{' + '.join(item.label for item in runs)}**\n\n"
+                        f"轨迹 `{index + 1}/{len(frames)}`："
+                        f"`{run.label} · {phase.cube_id} · {phase.name}`"
                     )
-                    for q in phase.joint_positions:
-                        if self._stop:
-                            return
-                        self._apply_waypoint(run, phase, q)
-                        time.sleep(1.0 / (self.config.playback_hz * float(self.speed.value)))
-                    if phase.name == "place":
-                        self._finish_place(run, phase.cube_id)
-                if not run.plan.report.success:
-                    self.status.content = (
-                        f"## Dual-arm Cube Shadow\n{run.label} 在 "
-                        f"`{run.plan.report.failed_cube}/{run.plan.report.failed_phase}` "
-                        f"规划失败，继续下一字母。"
-                    )
-                    time.sleep(1.0)
+                for _, _, kind, run, phase, q in actions:
+                    self._apply_event(kind, run, phase, q)
+                time.sleep(1.0 / (self.config.playback_hz * float(self.speed.value)))
             succeeded = [run.label for run in self.runs if run.plan.report.success]
+            missing = [run.label for run in self.runs if not run.plan.report.success]
             self.status.content = (
-                "## Dual-arm Cube Shadow\n**U → S → T 序列播放完成。**\n\n"
-                f"cuRobo 成功字母：`{', '.join(succeeded) or '无'}`"
+                "## Dual-arm Cube Shadow\n**左右协同装配播放完成。**\n\n"
+                f"完成：`{', '.join(succeeded) or '无'}`\n\n"
+                f"未完成：`{', '.join(missing) or '无'}`"
             )
         finally:
             self._playing = False
             self._set_controls_disabled(False)
-
-    def _video_sample_schedule(self, output_fps: float, speed: float) -> Counter:
-        times = []
-        current = 0.0
-        fallback_dt = 1.0 / self.config.playback_hz
-        for run in self.runs:
-            for phase in run.plan.phases:
-                dt = float(phase.dt) if float(phase.dt) > 0.0 else fallback_dt
-                for _ in phase.joint_positions:
-                    times.append(current)
-                    current += dt
-        times.append(current)
-        duration = current if current > 0.0 else 1.0
-        output_count = max(2, int(np.ceil(duration / speed * output_fps)) + 1)
-        requested = np.linspace(0.0, current, output_count)
-        available = np.asarray(times, dtype=float)
-        right = np.clip(np.searchsorted(available, requested, side="left"), 0, len(available) - 1)
-        left = np.clip(right - 1, 0, len(available) - 1)
-        selected = np.where(
-            np.abs(requested - available[left]) <= np.abs(available[right] - requested),
-            left,
-            right,
-        )
-        return Counter(int(index) for index in selected)
 
     def _video_render_size(self, client) -> tuple[int, int]:
         requested = {
@@ -421,9 +462,13 @@ class DualArmSequenceViewer:
             self._reset_scene()
             self.output_dir.mkdir(parents=True, exist_ok=True)
             speed = float(self.export_speed.value)
-            fps = 30.0
-            schedule = self._video_sample_schedule(fps, speed)
-            total = sum(schedule.values())
+            fps = EXPORT_OUTPUT_FPS
+            frames = self._playback_frames()
+            steps = export_capture_steps(
+                [item[0] for item in frames], fps, speed, EXPORT_CAPTURE_FPS
+            )
+            needed = {index: repeats for index, repeats in steps}
+            total = sum(needed.values())
             width, height = self._video_render_size(client)
             speed_tag = f"{speed:g}".replace(".", "p")
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -435,14 +480,10 @@ class DualArmSequenceViewer:
                 codec="libx264", macro_block_size=2, ffmpeg_log_level="error",
                 output_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
             )
-            source_index = 0
             written = 0
 
-            def capture() -> None:
+            def capture(repeats: int) -> None:
                 nonlocal written
-                repeats = schedule.get(source_index, 0)
-                if not repeats:
-                    return
                 frame = client.get_render(
                     height=height, width=width, transport_format="jpeg", timeout=30.0
                 )
@@ -453,23 +494,22 @@ class DualArmSequenceViewer:
                 written += repeats
                 self.status.content = (
                     f"## Dual-arm Cube Shadow\n**正在导出 U-S-T MP4…** "
-                    f"`{written}/{total}` 帧 · `{speed:g}×`"
+                    f"`{written}/{total}` 帧 · 成片 `{speed:g}×`"
                 )
 
-            for run in self.runs:
-                self._activate_run(run)
-                for phase in run.plan.phases:
-                    if phase.name == "pre_pick":
-                        self.cube_handles[(run.label, phase.cube_id)].visible = True
-                    for q in phase.joint_positions:
-                        if self._stop:
-                            raise InterruptedError
-                        self._apply_waypoint(run, phase, q)
-                        capture()
-                        source_index += 1
-                    if phase.name == "place":
-                        self._finish_place(run, phase.cube_id)
-            capture()
+            for source_index, (_, runs, actions, _, stage_start) in enumerate(frames):
+                if self._stop:
+                    raise InterruptedError
+                if stage_start:
+                    for run in runs:
+                        self._activate_run(run)
+                repeats = needed.get(source_index, 0)
+                for _, _, kind, run, phase, q in actions:
+                    if kind == "q" and repeats == 0:
+                        continue
+                    self._apply_event(kind, run, phase, q)
+                if repeats:
+                    capture(repeats)
             writer.close()
             writer = None
             partial_path.replace(final_path)

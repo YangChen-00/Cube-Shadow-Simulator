@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+# Browser captures are the slow part of export. The MP4 stays 30 FPS and the
+# speed slider still sets its duration; repeated frames fill the gaps.
+EXPORT_OUTPUT_FPS = 30.0
+EXPORT_CAPTURE_FPS = 10.0
 
 from .config import WorkcellConfig
 from .curobo_runner import CuroboAssemblyPlanner, CuroboPlan
@@ -117,6 +121,10 @@ class AssemblyViewer:
         self.server.gui.add_markdown("### 视频导出")
         self.export_speed = self.server.gui.add_slider(
             "下载视频速度", min=0.25, max=4.0, step=0.25, initial_value=1.0
+        )
+        self.server.gui.add_markdown(
+            "这个滑块只改变成片播放速度。导出时每秒成片抓取 10 帧，"
+            "再重复写成 30 FPS，所以导出更快，成片时长不变。"
         )
         self.export_resolution = self.server.gui.add_dropdown(
             "视频清晰度",
@@ -291,32 +299,18 @@ class AssemblyViewer:
             self.play_button.disabled = False
             self.record_button.disabled = False
 
-    def _video_sample_schedule(self, output_fps: float, speed: float) -> Counter:
-        """Map source waypoint indices to the number of MP4 frames to write."""
-        source_times = []
-        source_time = 0.0
+    def _trajectory_times(self) -> list[float]:
+        """One timestamp per waypoint, plus the finished pose after the last snap."""
+        times = []
+        current = 0.0
         fallback_dt = 1.0 / self.config.playback_hz
         for phase in self.plan.phases:
             dt = float(phase.dt) if float(phase.dt) > 0.0 else fallback_dt
             for _ in phase.joint_positions:
-                source_times.append(source_time)
-                source_time += dt
-
-        # The extra state is the finished layout after the final place snap.
-        source_times.append(source_time)
-        duration = source_time if source_time > 0.0 else 1.0
-        output_count = max(2, int(np.ceil(duration / speed * output_fps)) + 1)
-        requested_times = np.linspace(0.0, source_time, output_count)
-        source_times_array = np.asarray(source_times, dtype=float)
-        right = np.searchsorted(source_times_array, requested_times, side="left")
-        right = np.clip(right, 0, len(source_times_array) - 1)
-        left = np.clip(right - 1, 0, len(source_times_array) - 1)
-        use_left = (
-            np.abs(requested_times - source_times_array[left])
-            <= np.abs(source_times_array[right] - requested_times)
-        )
-        selected = np.where(use_left, left, right)
-        return Counter(int(index) for index in selected)
+                times.append(current)
+                current += dt
+        times.append(current)
+        return times
 
     def _video_render_size(self, client) -> tuple[int, int]:
         requested = {
@@ -357,9 +351,12 @@ class AssemblyViewer:
             self._stop = False
             self.output_dir.mkdir(parents=True, exist_ok=True)
             speed = float(self.export_speed.value)
-            output_fps = 30.0
-            schedule = self._video_sample_schedule(output_fps, speed)
-            output_frames = sum(schedule.values())
+            output_fps = EXPORT_OUTPUT_FPS
+            steps = export_capture_steps(
+                self._trajectory_times(), output_fps, speed, EXPORT_CAPTURE_FPS
+            )
+            needed = {index: repeats for index, repeats in steps}
+            output_frames = sum(needed.values())
             width, height = self._video_render_size(client)
             speed_tag = f"{speed:g}".replace(".", "p")
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -382,7 +379,7 @@ class AssemblyViewer:
 
             def capture_current_state() -> None:
                 nonlocal written
-                repeats = schedule.get(source_index, 0)
+                repeats = needed.get(source_index, 0)
                 if repeats == 0:
                     return
                 frame = client.get_render(
@@ -398,33 +395,30 @@ class AssemblyViewer:
                 written += repeats
                 self.status.content = (
                     "## Cube Shadow\n**正在录制 MP4…** "
-                    f"`{written}/{output_frames}` 帧 · `{speed:g}×` · "
+                    f"`{written}/{output_frames}` 帧 · 成片 `{speed:g}×` · "
                     f"`{width}×{height}`"
                 )
 
-            for phase_index, phase in enumerate(self.plan.phases, 1):
+            for phase in self.plan.phases:
                 if phase.name == "pre_pick":
                     self.obstacle_handles[phase.cube_id].visible = True
                 for q in phase.joint_positions:
                     if self._stop:
                         raise InterruptedError("用户停止了录制")
-                    self._set_robot(q, phase.joint_names)
-                    if phase.holding_cube:
-                        transform = (
-                            self._tool_matrix(q, phase.joint_names)
-                            @ self.plan.tool_to_cube[phase.cube_id]
-                        )
-                        self._set_cube(phase.cube_id, transform)
-                    capture_current_state()
+                    if source_index in needed:
+                        self._set_robot(q, phase.joint_names)
+                        if phase.holding_cube:
+                            transform = (
+                                self._tool_matrix(q, phase.joint_names)
+                                @ self.plan.tool_to_cube[phase.cube_id]
+                            )
+                            self._set_cube(phase.cube_id, transform)
+                        capture_current_state()
                     source_index += 1
                 if phase.name == "place":
                     task = targets[phase.cube_id]
                     position, quaternion = cube_pose_in_base(task.target, self.config)
                     self._set_cube(phase.cube_id, matrix(position, quaternion))
-                self.status.content = (
-                    "## Cube Shadow\n**正在录制 MP4…** "
-                    f"轨迹 `{phase_index}/{len(self.plan.phases)}`"
-                )
 
             capture_current_state()
             writer.close()
@@ -472,3 +466,47 @@ class AssemblyViewer:
         )
         while True:
             time.sleep(10.0)
+
+
+def export_capture_steps(
+    frame_times,
+    output_fps: float,
+    speed: float,
+    capture_fps: float = EXPORT_CAPTURE_FPS,
+) -> list[tuple[int, int]]:
+    """Return ``(source_index, mp4_frame_count)`` pairs for one export.
+
+    ``speed`` changes how long the file plays. ``capture_fps`` is how many
+    browser renders are taken per second of that file.
+    """
+    times = np.asarray(frame_times, dtype=float)
+    if times.size == 0:
+        return []
+    end = float(times[-1])
+    duration = end if end > 0.0 else 1.0
+    output_count = max(2, int(np.ceil(duration / speed * output_fps)) + 1)
+    capture_count = max(2, int(np.ceil(duration / speed * capture_fps)) + 1)
+    capture_count = min(capture_count, output_count)
+    output_times = np.linspace(0.0, end, output_count)
+    capture_times = np.linspace(0.0, end, capture_count)
+
+    def nearest(grid: np.ndarray, query: np.ndarray) -> np.ndarray:
+        right = np.clip(np.searchsorted(grid, query, side="left"), 0, grid.size - 1)
+        left = np.clip(right - 1, 0, grid.size - 1)
+        use_left = np.abs(query - grid[left]) <= np.abs(grid[right] - query)
+        return np.where(use_left, left, right)
+
+    chosen_capture = nearest(capture_times, output_times)
+    source_for_capture = nearest(times, capture_times)
+    steps: list[tuple[int, int]] = []
+    for capture_index, source_index in enumerate(source_for_capture.tolist()):
+        repeats = int(np.count_nonzero(chosen_capture == capture_index))
+        if repeats <= 0:
+            continue
+        source_index = int(source_index)
+        if steps and steps[-1][0] == source_index:
+            previous, count = steps[-1]
+            steps[-1] = (previous, count + repeats)
+        else:
+            steps.append((source_index, repeats))
+    return steps

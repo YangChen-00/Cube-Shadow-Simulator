@@ -37,14 +37,15 @@ def parser() -> argparse.ArgumentParser:
         cmd.add_argument("--debug", action="store_true", help="show the full remote traceback")
     sequence = sub.add_parser(
         "sequence",
-        help="plan and display a dual-arm U -> S -> T showcase",
+        help="plan a dual-arm U + T, then S showcase with arms on opposite sides",
     )
     sequence.add_argument("layouts", nargs=3, metavar=("U_JSON", "S_JSON", "T_JSON"))
     sequence.add_argument("--target-images", nargs=3, metavar=("U_PNG", "S_PNG", "T_PNG"))
     sequence.add_argument("--config", default=str(DEFAULT_CONFIG))
     sequence.add_argument("--output", default="runs/UST")
-    sequence.add_argument("--arm-separation", type=float, default=0.56, metavar="METRES")
-    sequence.add_argument("--letter-spacing", type=float, default=130.0, metavar="MM")
+    sequence.add_argument("--arm-separation", type=float, default=0.96, metavar="METRES")
+    sequence.add_argument("--arm-y", type=float, default=-0.20, metavar="METRES")
+    sequence.add_argument("--letter-spacing", type=float, default=240.0, metavar="MM")
     sequence.add_argument("--skip-warmup", action="store_true")
     sequence.add_argument("--debug", action="store_true")
     return root
@@ -118,20 +119,24 @@ def _run_sequence(args) -> int:
     from .curobo_runner import StaticCubeObstacle
     from .sequence import (
         SequenceRun,
+        arm_base_tabletop,
         arm_config,
         completed_cube_obstacles,
         write_shifted_layout,
     )
     from .sequence_viewer import DualArmSequenceViewer
 
-    if args.arm_separation <= 0.0:
-        raise ValueError("--arm-separation must be greater than zero")
+    if args.arm_separation < 0.80:
+        raise ValueError("--arm-separation must be at least 0.80 m so the arms flank the letters")
     if args.letter_spacing <= 0.0:
         raise ValueError("--letter-spacing must be greater than zero")
 
-    labels = ("U", "S", "T")
+    # U and T are on opposite sides, so those two arms can move together.
+    # S is in the centre and is assembled after both side letters are down.
+    labels = ("U", "T", "S")
     arms = ("left", "right", "right")
-    offsets = (-args.letter_spacing, 0.0, args.letter_spacing)
+    stages = (0, 0, 1)
+    offsets = (-args.letter_spacing, args.letter_spacing, 0.0)
     output = Path(args.output).expanduser().resolve()
     combined_bounds = (
         min(offsets) - 200.0,
@@ -139,18 +144,24 @@ def _run_sequence(args) -> int:
     )
     base_config = WorkcellConfig.load(args.config)
     arm_configs = {
-        arm: arm_config(base_config, arm, args.arm_separation)
+        arm: replace(
+            arm_config(base_config, arm, args.arm_separation, args.arm_y),
+            max_attempts=max(base_config.max_attempts, 8),
+        )
         for arm in ("left", "right")
     }
     images = args.target_images or (None, None, None)
+    layout_by_label = dict(zip(("U", "S", "T"), args.layouts))
+    image_by_label = dict(zip(("U", "S", "T"), images))
     completed: list[StaticCubeObstacle] = []
     runs = []
     summaries = []
     viewer_engine = None
 
-    for label, arm, offset, layout_path, target_image in zip(
-        labels, arms, offsets, args.layouts, images
-    ):
+    for label, arm, stage, offset in zip(labels, arms, stages, offsets):
+        layout_path = layout_by_label[label]
+        target_image = image_by_label[label]
+        print(f"Planning {label} with the {arm} arm...", flush=True)
         shifted = write_shifted_layout(
             layout_path,
             output / "handoff" / f"{label}.json",
@@ -181,14 +192,23 @@ def _run_sequence(args) -> int:
             config=arm_configs[arm],
             output_dir=result.output_dir,
             target_image=target_image,
+            stage=stage,
         ))
-        terminal = (
-            result.engine.current_state.position.detach().cpu().numpy().reshape(-1)
-        )
-        arm_configs[arm] = replace(
-            arm_configs[arm],
-            initial_joint_positions=tuple(float(value) for value in terminal),
-        )
+        if result.plan.report.success:
+            terminal = (
+                result.engine.current_state.position.detach().cpu().numpy().reshape(-1)
+            )
+            arm_configs[arm] = replace(
+                arm_configs[arm],
+                initial_joint_positions=tuple(float(value) for value in terminal),
+            )
+        else:
+            # A failed grasp leaves the arm folded into the cubes. The next
+            # letter on this arm starts from home so it can still be finished.
+            arm_configs[arm] = replace(
+                arm_configs[arm],
+                initial_joint_positions=None,
+            )
         completed.extend(completed_cube_obstacles(
             label,
             result.layout,
@@ -197,6 +217,7 @@ def _run_sequence(args) -> int:
         summaries.append({
             "shape": label,
             "arm": arm,
+            "stage": stage,
             "success": result.success,
             "completed_steps": result.plan.report.completed_steps,
             "total_steps": len(result.layout.placements),
@@ -213,11 +234,20 @@ def _run_sequence(args) -> int:
 
     sequence_summary = {
         "schema_version": "1.0",
-        "sequence": "U -> S -> T",
-        "arm_assignment": {"U": "left", "S": "right", "T": "right"},
-        "execution": "strictly serialized",
+        "sequence": "U + T, then S",
+        "arm_assignment": {"U": "left", "T": "right", "S": "right"},
+        "execution": "U and T simultaneous, then S",
         "arm_separation_m": args.arm_separation,
+        "arm_y_m": args.arm_y,
         "letter_spacing_mm": args.letter_spacing,
+        "arm_bases_tabletop_m": {
+            arm: {
+                "xyz_m": [round(float(v), 4) for v in xyz],
+                "yaw_rad": round(yaw, 4),
+            }
+            for arm in ("left", "right")
+            for xyz, yaw in [arm_base_tabletop(arm, args.arm_separation, args.arm_y)]
+        },
         "completed_cube_collision_obstacles": len(completed),
         "runs": summaries,
         "output_dir": str(output),

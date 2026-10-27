@@ -51,6 +51,9 @@ def make_tasks(layout: Layout, cfg: WorkcellConfig) -> List[CubeTask]:
         # envelope extends beyond the exact square by this amount, so a real
         # non-overlapping neighbour can otherwise make the final vertical
         # descent report a false attached-object collision.
+        # Four spheres extend past the real cube by this much in XY and in Z.
+        # A neighbour in the layer below can have zero cube-cube overlap and
+        # still intersect those spheres during the last centimetres of descent.
         sphere_overhang_mm = (math.sqrt(6.0) - 1.0) * side / 4.0
         activation_margin_mm = cfg.collision_activation_distance_m * 1000.0
         lateral_tolerance_mm = max(
@@ -58,9 +61,9 @@ def make_tasks(layout: Layout, cfg: WorkcellConfig) -> List[CubeTask]:
             sphere_overhang_mm + activation_margin_mm,
         )
         for previous in layout.placements[:index]:
-            vertical_overlap = side - abs(target.z - previous.pose.z)
+            vertical_gap = abs(target.z - previous.pose.z) - side
             if (
-                vertical_overlap > 1e-6
+                vertical_gap <= lateral_tolerance_mm
                 and footprint_gap(target, previous.pose, side, side)
                 <= lateral_tolerance_mm
                 and previous.id not in place_contacts

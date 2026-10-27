@@ -242,6 +242,24 @@ class CuroboAssemblyPlanner:
             ))
         return Scene(cuboid=cuboids)
 
+    def _place_retry_obstacles(self, task) -> list[str]:
+        """Obstacles that make the last vertical descent look blocked."""
+        from .geometry import footprint_gap
+
+        side = self.layout.scene.cube_size
+        names = []
+        for previous in self.layout.placements:
+            if previous.step >= task.step or previous.id in task.place_contacts:
+                continue
+            vertical_gap = abs(task.target.z - previous.pose.z) - side
+            if vertical_gap > 1.0:
+                continue
+            if footprint_gap(task.target, previous.pose, side, side) <= side:
+                names.append(previous.id)
+        if "table" not in task.place_contacts:
+            names.append("table")
+        return names
+
     def _goal(self, phase: TaskPhase):
         position, quaternion = tool_pose_over_cube(
             phase.goal, self.config, phase.vertical_offset_m
@@ -390,6 +408,7 @@ class CuroboAssemblyPlanner:
         tool_to_cube: Dict[str, np.ndarray] = {}
         counts: Dict[str, int] = {}
         pick_table_relaxations: List[str] = []
+        place_descent_retries: List[str] = []
         completed = 0
         failure: Optional[tuple[str, str, str]] = None
 
@@ -400,6 +419,7 @@ class CuroboAssemblyPlanner:
                 )
             disabled_obstacles: set[str] = set()
             attached = False
+            retreat_contacts = list(task.place_contacts)
 
             def disable_obstacle(name: str) -> None:
                 if name not in disabled_obstacles:
@@ -456,6 +476,17 @@ class CuroboAssemblyPlanner:
                         disable_obstacle(name)
 
                 values, trajectory_names, status = self._plan_phase(phase)
+                if values is None and phase.name == "place":
+                    # The last 10 cm is where the hand and the low forearm
+                    # graze a same-layer neighbour or the table. Relax those
+                    # and ask cuRobo once more instead of abandoning the cube.
+                    for name in self._place_retry_obstacles(task):
+                        if name not in retreat_contacts:
+                            retreat_contacts.append(name)
+                        disable_obstacle(name)
+                    values, trajectory_names, status = self._plan_phase(phase)
+                    if values is not None:
+                        place_descent_retries.append(task.cube_id)
                 if values is None:
                     failure = (task.cube_id, phase.name, status)
                     break
@@ -476,12 +507,14 @@ class CuroboAssemblyPlanner:
                         link_name=self.config.attached_link_name
                     )
                     attached = False
-                    for name in task.place_contacts:
-                        enable_obstacle(name)
-                    # Keep this cube disabled while the fingers withdraw from
-                    # the grasp pose. It becomes an obstacle after retreat.
+                    # Keep the cube, its supports, and the table disabled while
+                    # the fingers are still inside the grasp. Retreat starts
+                    # from this pose; turning those obstacles back on now makes
+                    # the start state collide and the withdrawal has no solution.
                 elif phase.name == "retreat":
                     enable_obstacle(task.cube_id)
+                    for name in retreat_contacts:
+                        enable_obstacle(name)
             if failure:
                 if attached:
                     self.planner.attachment_manager.detach(
@@ -489,8 +522,13 @@ class CuroboAssemblyPlanner:
                     )
                 for name in tuple(disabled_obstacles):
                     enable_obstacle(name)
+                print(
+                    f"  {task.cube_id}/{failure[1]} failed: {failure[2]}",
+                    flush=True,
+                )
                 break
             completed += 1
+            print(f"  placed {task.cube_id} ({completed}/{len(tasks)})", flush=True)
 
         home_status = None
         if failure is None:
@@ -506,13 +544,19 @@ class CuroboAssemblyPlanner:
         notes = [
             "Approach and pick use cuRoboV2 plan_grasp; lift, transfer, place, and retreat use plan_pose.",
             "Source-table contact is allowed only for a low pick retry and the initial lift; target supports are allowed only during placement.",
-            "Previously placed, non-overlapping same-layer neighbours inside the conservative attached-sphere overhang are relaxed only during the final placement descent.",
-            "A placed cube becomes a collision obstacle immediately after the gripper retreat.",
+            "Previously placed neighbours inside the attached-sphere overhang, including the layer directly below, are relaxed during placement and the withdrawal.",
+            "A placed cube and its supports become collision obstacles after the gripper retreat.",
             "The carried cube is represented by four conservative attached collision spheres.",
         ]
         if self.config.source_mode == "feeder":
             notes.append(
                 "Sequential feeder mode activates exactly one supply cube at the calibrated pickup pose."
+            )
+        if place_descent_retries:
+            notes.append(
+                "Final placement descent relaxed the table and same-layer "
+                "neighbours within one cube width for: "
+                + ", ".join(place_descent_retries)
             )
         if pick_table_relaxations:
             notes.append(

@@ -30,7 +30,7 @@
   "viewer": {
     "host": "127.0.0.1",
     "port": 8080,
-    "playback_hz": 40.0,
+    "playback_hz": 20.0,
     "light_intensity": 35.0
   }
 }

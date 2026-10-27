@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
@@ -12,7 +13,7 @@ import numpy as np
 from .config import WorkcellConfig
 from .curobo_runner import CuroboPlan, StaticCubeObstacle
 from .layout import Layout
-from .transforms import matrix, matrix_pose, quaternion_matrix
+from .transforms import matrix, matrix_pose
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class SequenceRun:
     config: WorkcellConfig
     output_dir: Path
     target_image: Optional[str] = None
+    stage: int = 0
 
     @property
     def base_to_tabletop(self) -> np.ndarray:
@@ -34,30 +36,67 @@ class SequenceRun:
         return np.linalg.inv(tabletop_to_base)
 
 
+# Pickup sits inward of each base, but downstage of S (which reaches y=-224 mm).
+FEEDER_INWARD_M = 0.30
+FEEDER_DOWNSTAGE_M = 0.28
+
+
+def arm_base_tabletop(
+    arm: str,
+    separation_m: float,
+    lateral_m: float,
+) -> tuple[np.ndarray, float]:
+    """Return the base position in tabletop metres and its yaw.
+
+    The arms stand on opposite sides of the letter row and face inward, so the
+    left arm reaches U from -X and the right arm reaches T from +X.
+    """
+    if arm not in {"left", "right"}:
+        raise ValueError("arm must be 'left' or 'right'")
+    sign = -1.0 if arm == "left" else 1.0
+    base = np.asarray([sign * 0.5 * separation_m, lateral_m, 0.0], dtype=float)
+    yaw = 0.0 if arm == "left" else math.pi
+    return base, yaw
+
+
+def _tabletop_in_robot_base(base_xyz: np.ndarray, yaw: float):
+    rotation = np.array(
+        [
+            [math.cos(yaw), -math.sin(yaw), 0.0],
+            [math.sin(yaw), math.cos(yaw), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+    translation = -rotation.T @ np.asarray(base_xyz, dtype=float)
+    half = -0.5 * yaw
+    quaternion = (math.cos(half), 0.0, 0.0, math.sin(half))
+    return tuple(float(v) for v in translation), quaternion
+
+
 def arm_config(
     base: WorkcellConfig,
     arm: str,
     separation_m: float,
+    lateral_m: float = -0.20,
 ) -> WorkcellConfig:
-    """Return a calibrated parallel-arm transform derived from one workcell.
+    """Place one arm on the left or right flank of the shared tabletop.
 
-    The two bases are translated along the tabletop X axis. Their orientation
-    and all robot-specific calibration values remain unchanged. Each arm gets
-    a feeder directly in front of its own base.
+    Tool calibration is preserved. Only the base pose and that arm's feeder
+    move, so each gripper works on its own side of U, S, and T.
     """
-    if arm not in {"left", "right"}:
-        raise ValueError("arm must be 'left' or 'right'")
-    base_x_tabletop = (-0.5 if arm == "left" else 0.5) * separation_m
-    delta_tabletop = np.asarray([base_x_tabletop, 0.0, 0.0], dtype=float)
-    rotation = quaternion_matrix(base.tabletop_quaternion_wxyz)
-    translated = np.asarray(base.tabletop_translation_m) - rotation @ delta_tabletop
-    source_x, source_y, source_z = base.source_origin_mm
+    base_xyz, yaw = arm_base_tabletop(arm, separation_m, lateral_m)
+    translation, quaternion = _tabletop_in_robot_base(base_xyz, yaw)
+    inward = FEEDER_INWARD_M if arm == "left" else -FEEDER_INWARD_M
+    feeder = base_xyz + np.asarray([inward, -FEEDER_DOWNSTAGE_M, 0.0], dtype=float)
+    _, _, source_z = base.source_origin_mm
     return replace(
         base,
-        tabletop_translation_m=tuple(float(v) for v in translated),
+        tabletop_translation_m=translation,
+        tabletop_quaternion_wxyz=quaternion,
         source_origin_mm=(
-            source_x + base_x_tabletop * 1000.0,
-            source_y,
+            float(feeder[0] * 1000.0),
+            float(feeder[1] * 1000.0),
             source_z,
         ),
     )
