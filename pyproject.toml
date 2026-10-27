@@ -13,6 +13,7 @@ authors = [{name = "Cube Shadow team"}]
 dependencies = [
   "numpy>=1.24",
   "Pillow>=10",
+  "imageio[ffmpeg]>=2.37",
   "viser>=1.1",
 ]
 

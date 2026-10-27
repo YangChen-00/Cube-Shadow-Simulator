@@ -84,6 +84,7 @@ def main(argv=None) -> int:
                 result.layout,
                 WorkcellConfig.load(args.config),
                 target_image,
+                result.output_dir,
             )
             viewer.serve_forever()
         elif result.engine is not None:
