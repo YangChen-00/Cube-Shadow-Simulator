@@ -198,13 +198,22 @@ class AssemblyViewer:
             )
 
         # Avoid ViserVisualizer.set_joint_state() here: its get_full_js() path
-        # cannot accept a trajectory that already contains only some lock joints.
+        # cannot accept a waypoint that already contains only some locked joints.
+        # plan_grasp waypoints also include gripper joints (panda_finger_joint1/2)
+        # that the exported display URDF does not actuate. Those keep their defaults.
         position = self._viser_default_positions.copy()
-        unknown = [name for name in names if name not in self._viser_joint_indices]
-        if unknown:
-            raise ValueError(f"Trajectory contains joints absent from Viser: {unknown}")
+        applied = 0
         for name, value in zip(names, values):
-            position[self._viser_joint_indices[name]] = value
+            index = self._viser_joint_indices.get(name)
+            if index is None:
+                continue
+            position[index] = value
+            applied += 1
+        if applied == 0:
+            raise ValueError(
+                "Trajectory joints do not overlap the Viser model: "
+                f"{list(names)} vs {list(self._viser_joint_names)}"
+            )
         self.visualizer._viser_urdf.update_cfg(position)
 
     def _tool_matrix(self, q: np.ndarray, joint_names) -> np.ndarray:

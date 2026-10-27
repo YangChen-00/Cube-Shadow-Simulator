@@ -248,16 +248,24 @@ class DualArmSequenceViewer:
                 f"Trajectory has {values.size} values for {len(names)} joint names"
             )
 
-        # A saved trajectory may contain some (but not all) locked joints. Calling
-        # cuRobo get_full_js() on that mixed state raises because it tries to add
-        # those joints a second time. Merge by name into a known-complete default
-        # configuration instead; absent locked joints retain their URDF defaults.
+        # Merge by name into a complete display configuration. cuRobo
+        # get_full_js() cannot accept a waypoint that already contains only some
+        # locked joints, and plan_grasp waypoints also include gripper joints
+        # (panda_finger_joint1/2) that ViserVisualizer locks out of the exported
+        # URDF. Joints the display model does not actuate keep their defaults.
         position = self._viser_default_positions.copy()
-        unknown = [name for name in names if name not in self._viser_joint_indices]
-        if unknown:
-            raise ValueError(f"Trajectory contains joints absent from Viser: {unknown}")
+        applied = 0
         for name, value in zip(names, values):
-            position[self._viser_joint_indices[name]] = value
+            index = self._viser_joint_indices.get(name)
+            if index is None:
+                continue
+            position[index] = value
+            applied += 1
+        if applied == 0:
+            raise ValueError(
+                "Trajectory joints do not overlap the Viser model: "
+                f"{list(names)} vs {list(self._viser_joint_names)}"
+            )
         self.arm_urdfs[arm].update_cfg(position)
 
     def _tool_matrix(self, q: np.ndarray, joint_names) -> np.ndarray:
