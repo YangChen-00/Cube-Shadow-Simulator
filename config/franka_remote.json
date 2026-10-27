@@ -1,0 +1,35 @@
+{
+  "robot_yaml": "franka.yml",
+  "tabletop_in_robot_base": {
+    "translation_m": [0.55, 0.0, 0.0],
+    "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0]
+  },
+  "tool_down_quaternion_tabletop_wxyz": [0.0, 1.0, 0.0, 0.0],
+  "tcp_to_cube_center_m": 0.105,
+  "approach_height_m": 0.10,
+  "lift_height_m": 0.14,
+  "attached_link_name": "attached_object",
+  "initial_joint_positions": null,
+  "cube_source": {
+    "origin_mm": [-330.0, -350.0, 20.0],
+    "columns": 4,
+    "gap_mm": 20.0
+  },
+  "table_thickness_m": 0.04,
+  "table_margin_m": 0.12,
+  "wall_thickness_m": 0.01,
+  "planner": {
+    "position_tolerance_m": 0.005,
+    "orientation_tolerance_rad": 0.05,
+    "collision_activation_distance_m": 0.01,
+    "max_attempts": 5,
+    "warmup_iterations": 5,
+    "interpolation_dt": 0.025
+  },
+  "viewer": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "playback_hz": 40.0,
+    "light_intensity": 35.0
+  }
+}

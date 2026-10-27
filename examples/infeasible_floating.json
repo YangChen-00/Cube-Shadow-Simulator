@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0",
+  "method": "grading_infeasible_example",
+  "coordinate_frame": {
+    "origin": "tabletop_origin", "unit": "mm", "x": "horizontal along screen",
+    "y": "toward screen", "z": "up", "yaw_unit": "degrees",
+    "yaw_positive": "counterclockwise about +z"
+  },
+  "scene": {
+    "cube_size": 40.0, "light": [0.0, -800.0, 30.0], "wall_y": 350.0,
+    "wall_bounds": [-160.0, 160.0, 0.0, 320.0], "image_size": [16, 16],
+    "build_bounds": [-200.0, 200.0, -250.0, 150.0]
+  },
+  "cube_cap": 2,
+  "placements": [
+    {"id": "cube_001", "step": 1, "x": 0.0, "y": 20.0, "z": 20.0, "yaw": 0.0, "grounded": true, "contacts_below_at_placement": []},
+    {"id": "cube_002", "step": 2, "x": 100.0, "y": 20.0, "z": 100.0, "yaw": 0.0, "grounded": false, "contacts_below_at_placement": []}
+  ],
+  "target": {"mask_sha256": "infeasible-demo", "image_size": [16, 16], "rows": "bottom_to_top"},
+  "metrics": {"continuous_iou": 0.0, "pixel_iou": 0.0, "missing_fraction": 1.0, "extra_fraction": 0.0, "negative_space_retention": 1.0},
+  "timings": {},
+  "validation": {"all_prefixes_stable": false, "contact_margin_mm": 4, "cube_count": 2, "within_build_area": true, "model": "intentionally infeasible"},
+  "contact_semantics": "second cube intentionally floats"
+}
+

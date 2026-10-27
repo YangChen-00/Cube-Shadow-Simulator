@@ -1,0 +1,4 @@
+# cuRoboV2 (nvidia-curobo >= 0.8) and CUDA PyTorch are installed separately
+# on the remote GPU server using NVlabs' official instructions.
+-e .
+
