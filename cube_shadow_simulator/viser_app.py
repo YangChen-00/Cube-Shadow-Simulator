@@ -42,14 +42,44 @@ class AssemblyViewer:
             visualize_robot_spheres=False,
         )
         self.server = self.visualizer._server
-        self.obstacle_handles = self.visualizer.add_scene(
-            engine.scene, add_control_frames=False
-        )
+        self.obstacle_handles = self._add_scene_boxes()
         self._playing = False
         self._stop = False
         self._add_lighting()
         self._add_gui(target_image)
         self._reset_scene()
+
+    def _add_scene_boxes(self):
+        """Create movable Viser nodes for every cuRobo cuboid.
+
+        cuRobo's ``add_scene(..., add_control_frames=False)`` intentionally
+        returns an empty dictionary: handles are only returned for interactive
+        control frames.  Assembly playback needs ordinary movable scene-node
+        handles instead, so mirror the same collision cuboids through Viser's
+        public primitive API.
+        """
+        handles = {}
+        for cuboid in self.engine.scene.cuboid:
+            pose = np.asarray(cuboid.pose, dtype=float).reshape(-1)
+            dims = np.asarray(cuboid.dims, dtype=float).reshape(-1)
+            raw_color = cuboid.color
+            if raw_color is None:
+                raw_color = [0.75, 0.75, 0.75, 1.0]
+            rgb = tuple(
+                int(round(255.0 * value)) if float(value) <= 1.0
+                else int(round(float(value)))
+                for value in raw_color[:3]
+            )
+            handles[cuboid.name] = self.server.scene.add_box(
+                name=f"/obstacles/{cuboid.name}",
+                dimensions=tuple(dims[:3]),
+                color=rgb,
+                position=tuple(pose[:3]),
+                wxyz=tuple(pose[3:7]),
+                cast_shadow=True,
+                receive_shadow=True,
+            )
+        return handles
 
     def _add_lighting(self) -> None:
         self.server.scene.configure_default_lights(enabled=False)
