@@ -291,26 +291,41 @@ class CuroboAssemblyPlanner:
         failure: Optional[tuple[str, str, str]] = None
 
         for task in tasks:
-            allowed_contacts: List[str] = []
+            disabled_obstacles: set[str] = set()
+            attached = False
+
+            def disable_obstacle(name: str) -> None:
+                if name not in disabled_obstacles:
+                    self.planner.scene_collision_checker.enable_obstacle(
+                        name, enable=False, env_idx=0
+                    )
+                    disabled_obstacles.add(name)
+
+            def enable_obstacle(name: str) -> None:
+                if name in disabled_obstacles:
+                    self.planner.scene_collision_checker.enable_obstacle(
+                        name, enable=True, env_idx=0
+                    )
+                    disabled_obstacles.remove(name)
+
             for phase in task.phases:
                 if phase.name == "pick":
-                    self.planner.scene_collision_checker.enable_obstacle(
-                        task.cube_id, enable=False, env_idx=0
-                    )
+                    # Grasp contact is intentional. The cube is represented by
+                    # attached spheres immediately after this phase succeeds.
+                    disable_obstacle(task.cube_id)
+                if phase.name == "lift":
+                    # At the first lift waypoint the attached cube still rests
+                    # on the supply table. Allow that contact until it is clear.
+                    disable_obstacle("table")
                 if phase.name == "place":
-                    allowed_contacts = list(task.supports) or ["table"]
-                    for name in allowed_contacts:
-                        self.planner.scene_collision_checker.enable_obstacle(
-                            name, enable=False, env_idx=0
-                        )
+                    # The final descent intentionally ends in contact with the
+                    # table or with cubes declared as supports by Studio.
+                    for name in (list(task.supports) or ["table"]):
+                        disable_obstacle(name)
 
                 values, trajectory_names, status = self._plan_phase(phase)
                 if values is None:
                     failure = (task.cube_id, phase.name, status)
-                    for name in allowed_contacts:
-                        self.planner.scene_collision_checker.enable_obstacle(
-                            name, enable=True, env_idx=0
-                        )
                     break
                 key = f"{task.step:03d}_{phase.name}"
                 phases.append(PlannedPhase(
@@ -321,6 +336,9 @@ class CuroboAssemblyPlanner:
 
                 if phase.name == "pick":
                     tool_to_cube[task.cube_id] = self._attach_cube(task)
+                    attached = True
+                elif phase.name == "lift":
+                    enable_obstacle("table")
                 elif phase.name == "place":
                     self.planner.scene_collision_checker.update_obstacle_pose(
                         task.cube_id, self._cube_curobo_pose(task, target=True), env_idx=0
@@ -328,15 +346,20 @@ class CuroboAssemblyPlanner:
                     self.planner.attachment_manager.detach(
                         link_name=self.config.attached_link_name
                     )
-                    self.planner.scene_collision_checker.enable_obstacle(
-                        task.cube_id, enable=True, env_idx=0
-                    )
-                    for name in allowed_contacts:
-                        self.planner.scene_collision_checker.enable_obstacle(
-                            name, enable=True, env_idx=0
-                        )
-                    allowed_contacts = []
+                    attached = False
+                    for name in (list(task.supports) or ["table"]):
+                        enable_obstacle(name)
+                    # Keep this cube disabled while the fingers withdraw from
+                    # the grasp pose. It becomes an obstacle after retreat.
+                elif phase.name == "retreat":
+                    enable_obstacle(task.cube_id)
             if failure:
+                if attached:
+                    self.planner.attachment_manager.detach(
+                        link_name=self.config.attached_link_name
+                    )
+                for name in tuple(disabled_obstacles):
+                    enable_obstacle(name)
                 break
             completed += 1
 
@@ -351,7 +374,8 @@ class CuroboAssemblyPlanner:
             phase_waypoints=counts,
             notes=[
                 "All robot feasibility claims come from cuRoboV2 plan_pose results.",
-                "Declared support surfaces are temporarily allowed only during the final placement descent.",
+                "Source-table contact is allowed only for the initial lift; target supports are allowed only during placement.",
+                "A placed cube becomes a collision obstacle immediately after the gripper retreat.",
                 "The carried cube is represented by four conservative attached collision spheres.",
             ],
         )

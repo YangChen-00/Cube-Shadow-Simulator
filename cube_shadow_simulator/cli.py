@@ -67,6 +67,8 @@ def main(argv=None) -> int:
             "curobo_success": bool(report and report.success),
             "completed_steps": 0 if report is None else report.completed_steps,
             "total_steps": len(result.layout.placements),
+            "planned_phases": 0 if result.plan is None else len(result.plan.phases),
+            "expected_phases": len(result.layout.placements) * 6,
             "failed_cube": None if report is None else report.failed_cube,
             "failed_phase": None if report is None else report.failed_phase,
             "failure_status": None if report is None else report.failure_status,

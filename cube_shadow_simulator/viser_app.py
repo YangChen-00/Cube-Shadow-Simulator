@@ -105,7 +105,8 @@ class AssemblyViewer:
         self.speed = self.server.gui.add_slider(
             "播放速度", min=0.25, max=4.0, step=0.25, initial_value=1.0
         )
-        play = self.server.gui.add_button("播放 cuRobo 轨迹")
+        play_label = "播放完整装配" if self.plan.report.success else "播放失败前轨迹"
+        play = self.server.gui.add_button(play_label)
         reset = self.server.gui.add_button("重置")
 
         @play.on_click
@@ -164,7 +165,8 @@ class AssemblyViewer:
             "## Cube Shadow\ncuRoboV2 已生成碰撞检查轨迹。\n\n点击“播放 cuRobo 轨迹”。"
             if self.plan.report.success else
             f"## Cube Shadow\n规划在 `{self.plan.report.failed_cube}/"
-            f"{self.plan.report.failed_phase}` 失败。可播放已完成部分。"
+            f"{self.plan.report.failed_phase}` 失败："
+            f"`{self.plan.report.failure_status}`\n\n可播放失败前轨迹。"
         )
 
     def _play(self) -> None:
@@ -191,7 +193,18 @@ class AssemblyViewer:
                     task = targets[phase.cube_id]
                     position, quaternion = cube_pose_in_base(task.target, self.config)
                     self._set_cube(phase.cube_id, matrix(position, quaternion))
-            self.status.content = "## Cube Shadow\n**装配播放完成。** 固定点光源正在墙面投射最终阴影。"
+            if self.plan.report.success:
+                self.status.content = (
+                    "## Cube Shadow\n**完整装配播放完成。** "
+                    "固定点光源正在墙面投射最终阴影。"
+                )
+            else:
+                self.status.content = (
+                    "## Cube Shadow\n已播放全部可用轨迹，但装配未完成。\n\n"
+                    f"cuRobo 在 `{self.plan.report.failed_cube}/"
+                    f"{self.plan.report.failed_phase}` 规划失败："
+                    f"`{self.plan.report.failure_status}`"
+                )
         finally:
             self._playing = False
 
