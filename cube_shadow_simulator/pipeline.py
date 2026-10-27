@@ -53,7 +53,7 @@ def run_pipeline(
         "studio_method": layout.method,
         "studio_shadow_metrics": layout.metrics,
         "workcell_config": str(Path(config_path).expanduser().resolve()),
-        "execution_authority": "cuRoboV2 MotionPlanner",
+        "execution_authority": "cuRoboV2 MotionPlanner plan_grasp + plan_pose",
         "viewer": "cuRobo ViserVisualizer",
         "coordinate_contract": (
             "Studio tabletop millimetres transformed by tabletop_in_robot_base; "

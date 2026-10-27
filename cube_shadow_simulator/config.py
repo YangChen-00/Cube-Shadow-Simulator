@@ -30,6 +30,7 @@ class WorkcellConfig:
     lift_height_m: float
     attached_link_name: str
     initial_joint_positions: Optional[Tuple[float, ...]]
+    source_mode: str
     source_origin_mm: Tuple[float, float, float]
     source_columns: int
     source_gap_mm: float
@@ -56,6 +57,9 @@ class WorkcellConfig:
         planner = raw.get("planner", {})
         viewer = raw.get("viewer", {})
         initial = raw.get("initial_joint_positions")
+        source_mode = str(source_cfg.get("mode", "grid"))
+        if source_mode not in {"grid", "feeder"}:
+            raise ValueError("cube_source.mode must be 'grid' or 'feeder'")
         return cls(
             robot_yaml=str(raw.get("robot_yaml", "franka.yml")),
             tabletop_translation_m=_tuple(frame, "translation_m", 3),
@@ -68,6 +72,7 @@ class WorkcellConfig:
             lift_height_m=float(raw.get("lift_height_m", 0.14)),
             attached_link_name=str(raw.get("attached_link_name", "attached_object")),
             initial_joint_positions=None if initial is None else tuple(float(v) for v in initial),
+            source_mode=source_mode,
             source_origin_mm=_tuple(source_cfg, "origin_mm", 3),
             source_columns=int(source_cfg.get("columns", 4)),
             source_gap_mm=float(source_cfg.get("gap_mm", 20.0)),

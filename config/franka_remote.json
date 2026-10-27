@@ -11,9 +11,10 @@
   "attached_link_name": "attached_object",
   "initial_joint_positions": null,
   "cube_source": {
-    "origin_mm": [-330.0, -350.0, 20.0],
-    "columns": 4,
-    "gap_mm": 20.0
+    "mode": "feeder",
+    "origin_mm": [0.0, -260.0, 20.0],
+    "columns": 1,
+    "gap_mm": 0.0
   },
   "table_thickness_m": 0.04,
   "table_margin_m": 0.12,

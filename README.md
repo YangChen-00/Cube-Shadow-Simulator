@@ -1,8 +1,8 @@
 # Cube Shadow Simulator（cuRoboV2 + Viser）
 
-本项目是 `Cube-Shadow-Studio` 的机器人端。Studio 把手绘阴影转换成有顺序和支撑关系的方块布局；Simulator 在远程 NVIDIA GPU 服务器上用 **cuRoboV2** 做 IK、轨迹优化、自碰撞、环境碰撞和携带物碰撞检查，再用 **cuRobo 自带的 ViserVisualizer** 播放真实关节轨迹、方块搬运过程以及固定点光源产生的墙面阴影。
+本项目是 `Cube-Shadow-Studio` 的机器人端。Studio 把手绘阴影转换成有顺序和支撑关系的方块布局；Simulator 在远程 NVIDIA GPU 服务器上用 **cuRoboV2** 做 IK、抓取规划、轨迹优化、自碰撞、环境碰撞和携带物碰撞检查，再用 **cuRobo 自带的 ViserVisualizer** 播放真实关节轨迹、方块搬运过程以及固定点光源产生的墙面阴影。
 
-项目不再包含自制运动学、PyBullet 后端或 HTML 假动画。`curobo_plan.json` 中的成功只来自 `MotionPlanner.plan_pose()`。
+项目不再包含自制运动学、PyBullet 后端或 HTML 假动画。`curobo_plan.json` 中的成功只来自 `MotionPlanner.plan_grasp()` 和 `MotionPlanner.plan_pose()`。
 
 ## 流程
 
@@ -12,7 +12,7 @@
   -> 静态承托 / 重力 / 方块重叠检查
   -> 标定变换 tabletop_in_robot_base
   -> cuRobo Scene（桌面、投影墙、供应区方块、已放置方块）
-  -> 每块：pre_pick -> pick -> lift -> pre_place -> place -> retreat
+  -> 每块：plan_grasp(pre_pick + pick) -> plan_pose(lift + pre_place + place + retreat)
   -> 携带方块作为 4 个 attached collision spheres
   -> 每放一块，更新 cuRobo collision world
   -> Viser 播放关节轨迹与动态阴影
@@ -46,7 +46,7 @@ pip install -e .
 - `tool_down_quaternion_tabletop_wxyz`：向下抓取时 TCP 姿态；
 - `tcp_to_cube_center_m`：抓住方块后 TCP 到方块中心的竖直距离；
 - `initial_joint_positions`：可填实测初始关节角；为 `null` 时使用机器人 YAML 的默认关节位姿；
-- `cube_source`：实体/仿真供应区中每块方块的位置。
+- `cube_source`：方块供应区。默认 `feeder` 模式在标定取料点逐块激活方块，避免大布局中远端托盘格不可达；`grid` 模式可用于实体托盘。
 
 仓库给出的数值只是 Franka 桌面演示模板，不是实机标定结果。最终录屏前必须换成课程服务器的机器人 YAML 和标定值。
 

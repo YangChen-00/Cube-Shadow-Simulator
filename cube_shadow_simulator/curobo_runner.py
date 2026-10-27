@@ -106,6 +106,13 @@ class CuroboAssemblyPlanner:
             interpolation_dt=config.interpolation_dt,
         )
         self.planner = MotionPlanner(planner_cfg)
+        if config.source_mode == "feeder":
+            # All feeder cubes share one physical pickup pose. Keep future
+            # cubes inactive until the previous cube has left the feeder.
+            for task in make_tasks(layout, config)[1:]:
+                self.planner.scene_collision_checker.enable_obstacle(
+                    task.cube_id, enable=False, env_idx=0
+                )
         self.plan_joint_names = list(self.planner.kinematics.joint_names)
         self.articulated_joint_names = list(
             getattr(self.planner.kinematics, "all_articulated_joint_names", []) or []
@@ -226,8 +233,25 @@ class CuroboAssemblyPlanner:
         if result is None or result.success is None or not bool(result.success.any().item()):
             return None, [], str(getattr(result, "status", "plan_pose returned no solution"))
         trajectory = result.get_interpolated_plan()
+        values, trajectory_names = self._trajectory_values(trajectory)
+        self.current_state = self.joint_state_from_waypoint(values[-1], trajectory_names)
+        return values, trajectory_names, "success"
+
+    def _trajectory_values(self, trajectory) -> tuple[np.ndarray, List[str]]:
+        if trajectory is None:
+            raise RuntimeError("cuRobo returned success without an interpolated trajectory")
         values = trajectory.position.detach().cpu().numpy()
         values = np.asarray(values).reshape(-1, values.shape[-1])
+        # cuRobo 0.8 plan_grasp may pad interpolated trajectories to a large
+        # fixed buffer with repeated terminal waypoints. Trim that padding so
+        # Viser does not appear frozen between phases.
+        if values.shape[0] > 1:
+            moving = np.any(np.abs(values - values[-1]) > 1e-4, axis=1)
+            if np.any(moving):
+                valid_length = min(int(np.flatnonzero(moving)[-1]) + 2, values.shape[0])
+                values = values[:valid_length]
+            else:
+                values = values[-1:]
         trajectory_names = list(
             getattr(trajectory, "joint_names", None)
             or self.articulated_joint_names
@@ -244,8 +268,40 @@ class CuroboAssemblyPlanner:
                     f"available joint rosters have {len(self.plan_joint_names)} plan "
                     f"joints and {len(self.articulated_joint_names)} articulated joints"
                 )
-        self.current_state = self.joint_state_from_waypoint(values[-1], trajectory_names)
-        return values, trajectory_names, "success"
+        return values, trajectory_names
+
+    def _plan_grasp_approach(
+        self, task: CubeTask
+    ) -> tuple[Optional[List[tuple[str, np.ndarray, List[str]]]], str]:
+        grasp_phase = TaskPhase("pick", task.cube_id, task.source, 0.0, False)
+        result = self.planner.plan_grasp(
+            grasp_poses=self._goal(grasp_phase),
+            current_state=self.current_state,
+            grasp_approach_axis="z",
+            grasp_approach_offset=-self.config.approach_height_m,
+            grasp_approach_in_tool_frame=True,
+            plan_approach_to_grasp=True,
+            plan_grasp_to_lift=False,
+        )
+        success = None if result is None else getattr(result, "success", None)
+        if success is None and result is not None:
+            success = getattr(result, "grasp_success", None)
+        if success is None or not bool(success.any().item()):
+            return None, str(getattr(result, "status", "plan_grasp returned no solution"))
+
+        approach = getattr(result, "approach_interpolated_trajectory", None)
+        grasp = getattr(result, "grasp_interpolated_trajectory", None)
+        if approach is None or grasp is None:
+            return None, "plan_grasp returned incomplete approach/grasp trajectories"
+        approach_values, approach_names = self._trajectory_values(approach)
+        grasp_values, grasp_names = self._trajectory_values(grasp)
+        self.current_state = self.joint_state_from_waypoint(
+            grasp_values[-1], grasp_names
+        )
+        return [
+            ("pre_pick", approach_values, approach_names),
+            ("pick", grasp_values, grasp_names),
+        ], "success"
 
     def _cube_curobo_pose(self, task: CubeTask, target: bool = False):
         item = task.target if target else task.source
@@ -292,6 +348,10 @@ class CuroboAssemblyPlanner:
         failure: Optional[tuple[str, str, str]] = None
 
         for task in tasks:
+            if self.config.source_mode == "feeder":
+                self.planner.scene_collision_checker.enable_obstacle(
+                    task.cube_id, enable=True, env_idx=0
+                )
             disabled_obstacles: set[str] = set()
             attached = False
 
@@ -309,11 +369,36 @@ class CuroboAssemblyPlanner:
                     )
                     disabled_obstacles.remove(name)
 
-            for phase in task.phases:
-                if phase.name == "pick":
-                    # Grasp contact is intentional. The cube is represented by
-                    # attached spheres immediately after this phase succeeds.
-                    disable_obstacle(task.cube_id)
+            # Use cuRoboV2's dedicated grasp planner for approach + grasp.
+            # It handles the low-clearance finger-link contact semantics that
+            # a generic pose-to-pose solve does not model robustly.
+            disable_obstacle(task.cube_id)
+            grasp_phases, status = self._plan_grasp_approach(task)
+            if grasp_phases is None and "table" not in disabled_obstacles:
+                full_collision_status = status
+                disable_obstacle("table")
+                grasp_phases, status = self._plan_grasp_approach(task)
+                if grasp_phases is not None:
+                    pick_table_relaxations.append(task.cube_id)
+                else:
+                    status = (
+                        f"full collision check: {full_collision_status}; "
+                        f"supply-table contact retry: {status}"
+                    )
+            if grasp_phases is None:
+                failure = (task.cube_id, "pick", status)
+            else:
+                for name, values, trajectory_names in grasp_phases:
+                    key = f"{task.step:03d}_{name}"
+                    phases.append(PlannedPhase(
+                        key, task.cube_id, name, False, values,
+                        trajectory_names, self.config.interpolation_dt,
+                    ))
+                    counts[key] = int(values.shape[0])
+                tool_to_cube[task.cube_id] = self._attach_cube(task)
+                attached = True
+
+            for phase in task.phases[2:] if failure is None else ():
                 if phase.name == "lift":
                     # At the first lift waypoint the attached cube still rests
                     # on the supply table. Allow that contact until it is clear.
@@ -325,26 +410,6 @@ class CuroboAssemblyPlanner:
                         disable_obstacle(name)
 
                 values, trajectory_names, status = self._plan_phase(phase)
-                if (
-                    values is None
-                    and phase.name == "pick"
-                    and "table" not in disabled_obstacles
-                ):
-                    # Prefer a fully collision-checked grasp. If the Franka
-                    # hand's conservative collision spheres touch the support
-                    # margin at the low grasp pose, retry only this contact
-                    # segment with the supply table allowed. The table stays
-                    # allowed through lift start and is restored after lift.
-                    full_collision_status = status
-                    disable_obstacle("table")
-                    values, trajectory_names, status = self._plan_phase(phase)
-                    if values is not None:
-                        pick_table_relaxations.append(task.cube_id)
-                    else:
-                        status = (
-                            f"full collision check: {full_collision_status}; "
-                            f"supply-table contact retry: {status}"
-                        )
                 if values is None:
                     failure = (task.cube_id, phase.name, status)
                     break
@@ -355,10 +420,7 @@ class CuroboAssemblyPlanner:
                 ))
                 counts[key] = int(values.shape[0])
 
-                if phase.name == "pick":
-                    tool_to_cube[task.cube_id] = self._attach_cube(task)
-                    attached = True
-                elif phase.name == "lift":
+                if phase.name == "lift":
                     enable_obstacle("table")
                 elif phase.name == "place":
                     self.planner.scene_collision_checker.update_obstacle_pose(
@@ -385,11 +447,15 @@ class CuroboAssemblyPlanner:
             completed += 1
 
         notes = [
-            "All robot feasibility claims come from cuRoboV2 plan_pose results.",
+            "Approach and pick use cuRoboV2 plan_grasp; lift, transfer, place, and retreat use plan_pose.",
             "Source-table contact is allowed only for a low pick retry and the initial lift; target supports are allowed only during placement.",
             "A placed cube becomes a collision obstacle immediately after the gripper retreat.",
             "The carried cube is represented by four conservative attached collision spheres.",
         ]
+        if self.config.source_mode == "feeder":
+            notes.append(
+                "Sequential feeder mode activates exactly one supply cube at the calibrated pickup pose."
+            )
         if pick_table_relaxations:
             notes.append(
                 "Supply-table contact relaxation was required at pick for: "

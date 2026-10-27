@@ -28,6 +28,9 @@ class CubeTask:
 
 
 def source_pose(index: int, side: float, cfg: WorkcellConfig) -> Pose:
+    if cfg.source_mode == "feeder":
+        x, y, z = cfg.source_origin_mm
+        return Pose(x, y, z, 0.0)
     spacing = side + cfg.source_gap_mm
     row, column = divmod(index, cfg.source_columns)
     x, y, z = cfg.source_origin_mm

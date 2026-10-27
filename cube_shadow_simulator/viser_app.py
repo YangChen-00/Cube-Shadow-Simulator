@@ -158,9 +158,11 @@ class AssemblyViewer:
         self._set_robot(
             self.plan.initial_joint_positions, self.plan.initial_joint_names
         )
-        for task in self.plan.tasks:
+        for task_index, task in enumerate(self.plan.tasks):
             position, quaternion = cube_pose_in_base(task.source, self.config)
             self._set_cube(task.cube_id, matrix(position, quaternion))
+            if self.config.source_mode == "feeder":
+                self.obstacle_handles[task.cube_id].visible = task_index == 0
         self.status.content = (
             "## Cube Shadow\ncuRoboV2 已生成碰撞检查轨迹。\n\n点击“播放 cuRobo 轨迹”。"
             if self.plan.report.success else
@@ -176,6 +178,8 @@ class AssemblyViewer:
         targets = {task.cube_id: task for task in self.plan.tasks}
         try:
             for phase_index, phase in enumerate(self.plan.phases, 1):
+                if phase.name == "pre_pick":
+                    self.obstacle_handles[phase.cube_id].visible = True
                 self.status.content = (
                     f"## Cube Shadow\n步骤 `{phase_index}/{len(self.plan.phases)}`："
                     f"`{phase.cube_id} · {phase.name}`"
