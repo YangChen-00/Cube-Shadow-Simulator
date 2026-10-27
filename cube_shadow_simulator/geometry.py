@@ -78,6 +78,37 @@ def footprints_overlap(a: Pose, b: Pose, side_a: float, side_b: float, tolerance
     return polygon_area(clip(square(a, side_a), square(b, side_b))) > tolerance_area
 
 
+def _point_segment_distance(point: Point, start: Point, end: Point) -> float:
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length_sq = dx * dx + dy * dy
+    if length_sq <= 1e-18:
+        return math.hypot(point[0] - start[0], point[1] - start[1])
+    t = max(0.0, min(1.0, (
+        (point[0] - start[0]) * dx + (point[1] - start[1]) * dy
+    ) / length_sq))
+    closest = (start[0] + t * dx, start[1] + t * dy)
+    return math.hypot(point[0] - closest[0], point[1] - closest[1])
+
+
+def footprint_gap(a: Pose, b: Pose, side_a: float, side_b: float) -> float:
+    """Minimum XY distance between two rotated square footprints in mm."""
+    if footprints_overlap(a, b, side_a, side_b):
+        return 0.0
+    a_poly, b_poly = square(a, side_a), square(b, side_b)
+    distances = []
+    for point in a_poly:
+        distances.extend(
+            _point_segment_distance(point, start, end)
+            for start, end in zip(b_poly, b_poly[1:] + b_poly[:1])
+        )
+    for point in b_poly:
+        distances.extend(
+            _point_segment_distance(point, start, end)
+            for start, end in zip(a_poly, a_poly[1:] + a_poly[:1])
+        )
+    return min(distances, default=math.inf)
+
+
 def volumes_overlap(a: Pose, b: Pose, side: float) -> bool:
     vertical = min(a.z + side / 2, b.z + side / 2) - max(a.z - side / 2, b.z - side / 2)
     return vertical > 1e-6 and footprints_overlap(a, b, side, side)

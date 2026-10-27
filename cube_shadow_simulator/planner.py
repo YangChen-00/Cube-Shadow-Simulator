@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import List
 
 from .config import WorkcellConfig
+from .geometry import footprint_gap
 from .layout import Layout
 from .models import Pose
 
@@ -24,6 +25,7 @@ class CubeTask:
     source: Pose
     target: Pose
     supports: tuple[str, ...]
+    place_contacts: tuple[str, ...]
     phases: tuple[TaskPhase, ...]
 
 
@@ -43,12 +45,24 @@ def make_tasks(layout: Layout, cfg: WorkcellConfig) -> List[CubeTask]:
     for index, cube in enumerate(layout.placements):
         source = source_pose(index, side, cfg)
         target = cube.pose
+        place_contacts = list(cube.contacts_below) or ["table"]
+        lateral_tolerance_mm = max(1.0, side * 0.025)
+        for previous in layout.placements[:index]:
+            vertical_overlap = side - abs(target.z - previous.pose.z)
+            if (
+                vertical_overlap > 1e-6
+                and footprint_gap(target, previous.pose, side, side)
+                <= lateral_tolerance_mm
+                and previous.id not in place_contacts
+            ):
+                place_contacts.append(previous.id)
         result.append(CubeTask(
             cube_id=cube.id,
             step=cube.step,
             source=source,
             target=target,
             supports=cube.contacts_below,
+            place_contacts=tuple(place_contacts),
             phases=(
                 TaskPhase("pre_pick", cube.id, source, cfg.approach_height_m, False),
                 TaskPhase("pick", cube.id, source, 0.0, False),

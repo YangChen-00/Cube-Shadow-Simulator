@@ -60,7 +60,7 @@ class CuroboPlan:
                     "step": task.step,
                     "source_mm_deg": asdict(task.source),
                     "target_mm_deg": asdict(task.target),
-                    "allowed_place_contacts": list(task.supports) or ["table"],
+                    "allowed_place_contacts": list(task.place_contacts),
                 }
                 for task in self.tasks
             ],
@@ -406,7 +406,7 @@ class CuroboAssemblyPlanner:
                 if phase.name == "place":
                     # The final descent intentionally ends in contact with the
                     # table or with cubes declared as supports by Studio.
-                    for name in (list(task.supports) or ["table"]):
+                    for name in task.place_contacts:
                         disable_obstacle(name)
 
                 values, trajectory_names, status = self._plan_phase(phase)
@@ -430,7 +430,7 @@ class CuroboAssemblyPlanner:
                         link_name=self.config.attached_link_name
                     )
                     attached = False
-                    for name in (list(task.supports) or ["table"]):
+                    for name in task.place_contacts:
                         enable_obstacle(name)
                     # Keep this cube disabled while the fingers withdraw from
                     # the grasp pose. It becomes an obstacle after retreat.
@@ -449,6 +449,7 @@ class CuroboAssemblyPlanner:
         notes = [
             "Approach and pick use cuRoboV2 plan_grasp; lift, transfer, place, and retreat use plan_pose.",
             "Source-table contact is allowed only for a low pick retry and the initial lift; target supports are allowed only during placement.",
+            "Previously placed cubes in exact side contact are allowed only during the final placement descent.",
             "A placed cube becomes a collision obstacle immediately after the gripper retreat.",
             "The carried cube is represented by four conservative attached collision spheres.",
         ]
