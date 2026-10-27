@@ -34,6 +34,7 @@ def parser() -> argparse.ArgumentParser:
         cmd.add_argument("--output", default="runs/latest")
         cmd.add_argument("--target-image", help="optional target silhouette shown in the Viser panel")
         cmd.add_argument("--skip-warmup", action="store_true", help="skip CUDA graph warmup")
+        cmd.add_argument("--debug", action="store_true", help="show the full remote traceback")
     return root
 
 
@@ -87,5 +88,7 @@ def main(argv=None) -> int:
             result.engine.planner.destroy()
         return 0 if result.success else 1
     except (LayoutError, OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        if args.debug:
+            raise
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

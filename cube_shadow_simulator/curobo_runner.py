@@ -22,6 +22,7 @@ class PlannedPhase:
     name: str
     holding_cube: bool
     joint_positions: np.ndarray
+    joint_names: List[str]
     dt: float
 
 
@@ -29,6 +30,7 @@ class PlannedPhase:
 class CuroboPlan:
     report: ExecutionReport
     initial_joint_positions: np.ndarray
+    initial_joint_names: List[str] = field(default_factory=list)
     phases: List[PlannedPhase] = field(default_factory=list)
     tasks: List[CubeTask] = field(default_factory=list)
     tool_to_cube: Dict[str, np.ndarray] = field(default_factory=dict)
@@ -39,6 +41,7 @@ class CuroboPlan:
             "planner": "cuRoboV2 MotionPlanner",
             "report": self.report.to_dict(),
             "initial_joint_positions": self.initial_joint_positions.tolist(),
+            "initial_joint_names": self.initial_joint_names,
             "phases": [
                 {
                     "key": p.key,
@@ -46,6 +49,7 @@ class CuroboPlan:
                     "name": p.name,
                     "holding_cube": p.holding_cube,
                     "waypoints": int(p.joint_positions.shape[0]),
+                    "joint_names": p.joint_names,
                     "dt": p.dt,
                 }
                 for p in self.phases
@@ -102,6 +106,10 @@ class CuroboAssemblyPlanner:
             interpolation_dt=config.interpolation_dt,
         )
         self.planner = MotionPlanner(planner_cfg)
+        self.plan_joint_names = list(self.planner.kinematics.joint_names)
+        self.articulated_joint_names = list(
+            getattr(self.planner.kinematics, "all_articulated_joint_names", []) or []
+        )
         if warmup:
             self.planner.warmup(
                 enable_graph=True,
@@ -113,18 +121,41 @@ class CuroboAssemblyPlanner:
         if self.config.initial_joint_positions is None:
             position = self.planner.default_joint_state.position
         else:
-            if len(self.config.initial_joint_positions) != len(self.planner.joint_names):
-                raise RuntimeError(
-                    "initial_joint_positions length does not match the robot's active joints"
-                )
             position = self.torch.tensor(
                 self.config.initial_joint_positions,
                 device="cuda",
                 dtype=self.torch.float32,
             )
-        if position.ndim == 1:
-            position = position.unsqueeze(0)
-        return self.JointState.from_position(position, joint_names=self.planner.joint_names)
+        position = position.reshape(-1)
+        position = self._project_to_plan_space(position)
+        return self.JointState.from_position(
+            position.unsqueeze(0), joint_names=self.plan_joint_names
+        )
+
+    def _project_to_plan_space(self, position, source_names=None):
+        """Drop locked joints from a full cuRobo waypoint before the next solve."""
+        if position.shape[-1] == len(self.plan_joint_names):
+            return position
+        names = list(source_names or self.articulated_joint_names)
+        if position.shape[-1] != len(names) or not all(
+            name in names for name in self.plan_joint_names
+        ):
+            raise RuntimeError(
+                f"Cannot map {position.shape[-1]} joints to cuRobo plan space "
+                f"{self.plan_joint_names}; source roster is {names}"
+            )
+        indices = [names.index(name) for name in self.plan_joint_names]
+        index = self.torch.tensor(indices, device=position.device, dtype=self.torch.long)
+        return position.index_select(-1, index)
+
+    def joint_state_from_waypoint(self, position: np.ndarray, joint_names: List[str]):
+        tensor = self.torch.as_tensor(
+            position, device="cuda", dtype=self.torch.float32
+        ).reshape(-1)
+        tensor = self._project_to_plan_space(tensor, joint_names)
+        return self.JointState.from_position(
+            tensor.unsqueeze(0), joint_names=self.plan_joint_names
+        )
 
     def _make_scene(self, Scene, Cuboid):
         side = self.layout.scene.cube_size
@@ -184,24 +215,37 @@ class CuroboAssemblyPlanner:
             quaternion=quat.reshape(1, 1, 1, 1, 4),
         )
 
-    def _plan_phase(self, phase: TaskPhase) -> tuple[Optional[np.ndarray], str]:
+    def _plan_phase(
+        self, phase: TaskPhase
+    ) -> tuple[Optional[np.ndarray], List[str], str]:
         result = self.planner.plan_pose(
             self._goal(phase),
             self.current_state,
             max_attempts=self.config.max_attempts,
         )
         if result is None or result.success is None or not bool(result.success.any().item()):
-            return None, str(getattr(result, "status", "plan_pose returned no solution"))
+            return None, [], str(getattr(result, "status", "plan_pose returned no solution"))
         trajectory = result.get_interpolated_plan()
         values = trajectory.position.detach().cpu().numpy()
         values = np.asarray(values).reshape(-1, values.shape[-1])
-        endpoint = self.torch.as_tensor(
-            values[-1], device="cuda", dtype=self.torch.float32
-        ).unsqueeze(0)
-        self.current_state = self.JointState.from_position(
-            endpoint, joint_names=self.planner.joint_names
+        trajectory_names = list(
+            getattr(trajectory, "joint_names", None)
+            or self.articulated_joint_names
+            or self.plan_joint_names
         )
-        return values, "success"
+        if len(trajectory_names) != values.shape[-1]:
+            if len(self.articulated_joint_names) == values.shape[-1]:
+                trajectory_names = self.articulated_joint_names
+            elif len(self.plan_joint_names) == values.shape[-1]:
+                trajectory_names = self.plan_joint_names
+            else:
+                raise RuntimeError(
+                    f"cuRobo returned {values.shape[-1]} trajectory joints, but the "
+                    f"available joint rosters have {len(self.plan_joint_names)} plan "
+                    f"joints and {len(self.articulated_joint_names)} articulated joints"
+                )
+        self.current_state = self.joint_state_from_waypoint(values[-1], trajectory_names)
+        return values, trajectory_names, "success"
 
     def _cube_curobo_pose(self, task: CubeTask, target: bool = False):
         item = task.target if target else task.source
@@ -210,10 +254,12 @@ class CuroboAssemblyPlanner:
 
     def _attach_cube(self, task: CubeTask) -> np.ndarray:
         side = self.layout.scene.cube_size / 1000.0
-        radius = math.sqrt(3.0) * side / 4.0
+        # franka.yml reserves four spheres for attached_object. Four spheres
+        # centred on the XY quadrants conservatively enclose the full cube.
+        radius = math.sqrt(6.0) * side / 4.0
         centres = [
-            [sx*side/4, sy*side/4, sz*side/4, radius]
-            for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)
+            [sx*side/4, sy*side/4, 0.0, radius]
+            for sx in (-1, 1) for sy in (-1, 1)
         ]
         spheres = self.torch.tensor(centres, device="cuda", dtype=self.torch.float32)
         self.planner.attachment_manager.update(
@@ -258,7 +304,7 @@ class CuroboAssemblyPlanner:
                             name, enable=False, env_idx=0
                         )
 
-                values, status = self._plan_phase(phase)
+                values, trajectory_names, status = self._plan_phase(phase)
                 if values is None:
                     failure = (task.cube_id, phase.name, status)
                     for name in allowed_contacts:
@@ -269,7 +315,7 @@ class CuroboAssemblyPlanner:
                 key = f"{task.step:03d}_{phase.name}"
                 phases.append(PlannedPhase(
                     key, task.cube_id, phase.name, phase.holding_cube,
-                    values, self.config.interpolation_dt,
+                    values, trajectory_names, self.config.interpolation_dt,
                 ))
                 counts[key] = int(values.shape[0])
 
@@ -306,10 +352,17 @@ class CuroboAssemblyPlanner:
             notes=[
                 "All robot feasibility claims come from cuRoboV2 plan_pose results.",
                 "Declared support surfaces are temporarily allowed only during the final placement descent.",
-                "The carried cube is represented by eight conservative attached collision spheres.",
+                "The carried cube is represented by four conservative attached collision spheres.",
             ],
         )
-        return CuroboPlan(report, initial, phases, tasks, tool_to_cube)
+        return CuroboPlan(
+            report=report,
+            initial_joint_positions=initial,
+            initial_joint_names=self.plan_joint_names,
+            phases=phases,
+            tasks=tasks,
+            tool_to_cube=tool_to_cube,
+        )
 
 
 def _version_pair(value: str) -> tuple[int, int]:

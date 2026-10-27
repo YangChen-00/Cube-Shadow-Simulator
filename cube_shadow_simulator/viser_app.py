@@ -97,19 +97,20 @@ class AssemblyViewer:
                 image = np.asarray(Image.open(path).convert("RGB"))
                 self.server.gui.add_image(image, label="目标阴影", format="png")
 
-    def _joint_state(self, q: np.ndarray):
+    def _joint_state(self, q: np.ndarray, joint_names):
         tensor = self.engine.torch.as_tensor(
             q, device="cuda", dtype=self.engine.torch.float32
         ).unsqueeze(0)
         return self.JointState.from_position(
-            tensor, joint_names=self.engine.planner.joint_names
+            tensor, joint_names=joint_names
         )
 
-    def _set_robot(self, q: np.ndarray) -> None:
-        self.visualizer.set_joint_state(self._joint_state(q).squeeze(0))
+    def _set_robot(self, q: np.ndarray, joint_names) -> None:
+        self.visualizer.set_joint_state(self._joint_state(q, joint_names).squeeze(0))
 
-    def _tool_matrix(self, q: np.ndarray) -> np.ndarray:
-        state = self.engine.planner.compute_kinematics(self._joint_state(q))
+    def _tool_matrix(self, q: np.ndarray, joint_names) -> np.ndarray:
+        plan_state = self.engine.joint_state_from_waypoint(q, list(joint_names))
+        state = self.engine.planner.compute_kinematics(plan_state)
         tool = state.tool_poses.get_link_pose(self.engine.planner.tool_frames[0])
         position = tool.position.reshape(-1, 3)[0].detach().cpu().numpy()
         quaternion = tool.quaternion.reshape(-1, 4)[0].detach().cpu().numpy()
@@ -123,7 +124,9 @@ class AssemblyViewer:
 
     def _reset_scene(self) -> None:
         self._stop = False
-        self._set_robot(self.plan.initial_joint_positions)
+        self._set_robot(
+            self.plan.initial_joint_positions, self.plan.initial_joint_names
+        )
         for task in self.plan.tasks:
             position, quaternion = cube_pose_in_base(task.source, self.config)
             self._set_cube(task.cube_id, matrix(position, quaternion))
@@ -148,9 +151,9 @@ class AssemblyViewer:
                 for q in phase.joint_positions:
                     if self._stop:
                         return
-                    self._set_robot(q)
+                    self._set_robot(q, phase.joint_names)
                     if phase.holding_cube:
-                        transform = self._tool_matrix(q) @ self.plan.tool_to_cube[phase.cube_id]
+                        transform = self._tool_matrix(q, phase.joint_names) @ self.plan.tool_to_cube[phase.cube_id]
                         self._set_cube(phase.cube_id, transform)
                     delay = 1.0 / (self.config.playback_hz * float(self.speed.value))
                     time.sleep(delay)

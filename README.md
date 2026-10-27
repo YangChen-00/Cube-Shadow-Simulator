@@ -13,7 +13,7 @@
   -> 标定变换 tabletop_in_robot_base
   -> cuRobo Scene（桌面、投影墙、供应区方块、已放置方块）
   -> 每块：pre_pick -> pick -> lift -> pre_place -> place -> retreat
-  -> 携带方块作为 attached collision spheres
+  -> 携带方块作为 4 个 attached collision spheres
   -> 每放一块，更新 cuRobo collision world
   -> Viser 播放关节轨迹与动态阴影
 ```
@@ -70,6 +70,11 @@ ssh -L 8080:127.0.0.1:8080 USER@SERVER
 ```
 
 然后打开 `http://127.0.0.1:8080`，点击“播放 cuRobo 轨迹”。
+
+若远程环境仍报错，可在原命令末尾增加 `--debug` 输出完整 traceback。Franka
+配置会在规划时使用 7 个主动臂关节，但插值轨迹可能包含 2 个被锁定的夹爪关节；
+Simulator 会按关节名把 9 维轨迹端点投影回 7 维规划空间，并保留完整轨迹供 Viser
+播放。
 
 只规划并保存证据、不启动网页：
 
