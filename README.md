@@ -2,7 +2,7 @@
 
 本项目是 `Cube-Shadow-Studio` 的机器人端。Studio 把手绘阴影转换成有顺序和支撑关系的方块布局；Simulator 在远程 NVIDIA GPU 服务器上用 **cuRoboV2** 做 IK、抓取规划、轨迹优化、自碰撞、环境碰撞和携带物碰撞检查，再用 **cuRobo 自带的 ViserVisualizer** 播放真实关节轨迹、方块搬运过程以及固定点光源产生的墙面阴影。
 
-项目不再包含自制运动学、PyBullet 后端或 HTML 假动画。`curobo_plan.json` 中的成功只来自 `MotionPlanner.plan_grasp()` 和 `MotionPlanner.plan_pose()`。
+项目不再包含自制运动学、PyBullet 后端或 HTML 假动画。保存和播放的所有机械臂轨迹只来自 `MotionPlanner.plan_grasp()`、`MotionPlanner.plan_pose()` 和返回待机位的 `MotionPlanner.plan_cspace()`；不会在规划失败处补假动画。
 
 ## 流程
 
@@ -13,6 +13,7 @@
   -> 标定变换 tabletop_in_robot_base
   -> cuRobo Scene（桌面、投影墙、供应区方块、已放置方块）
   -> 每块：plan_grasp(pre_pick + pick) -> plan_pose(lift + pre_place + place + retreat)
+  -> 每个字母完成后：plan_cspace(return home)
   -> 携带方块作为 4 个 attached collision spheres
   -> 每放一块，更新 cuRobo collision world
   -> Viser 播放关节轨迹与动态阴影
@@ -77,6 +78,27 @@ ssh -L 8080:127.0.0.1:8080 USER@SERVER
 会改变成片时长，不会重新运行运动规划。同一份 MP4 也会保存到 `--output`
 指定的目录。录制时请保持 Viser 页面连接，并在开始前调整好镜头。
 
+## 双机械臂 U → S → T 演示
+
+`sequence` 会加载 Studio 的 U、S、T 三份布局，把三个字母沿桌面 X 方向错开放置，并在场景两侧建立两台由同一机器人 YAML 派生的机械臂。左臂装 U、右臂装 S、左臂再装 T；整个流程严格串行，避免未经验证的双臂同步运动。每个字母结束后，cuRobo 会规划回待机位；若回位无解，后续同一机械臂会直接从上一段真实终点继续规划，不会在画面中跳回默认姿态。已经完成的字母会保留在墙前，并作为静态方块障碍加入后续字母的 cuRobo 场景。
+
+```bash
+cube-shadow-sim sequence \
+  ../Cube-Shadow-Studio/handoff/current_examples/U.json \
+  ../Cube-Shadow-Studio/handoff/current_examples/S.json \
+  ../Cube-Shadow-Studio/handoff/current_examples/T.json \
+  --target-images \
+    ../Cube-Shadow-Studio/web/samples/U.png \
+    ../Cube-Shadow-Studio/web/samples/S.png \
+    ../Cube-Shadow-Studio/web/samples/T.png \
+  --config config/franka_remote.json \
+  --output runs/UST
+```
+
+默认机械臂基座间距为 `0.56 m`，字母中心间距为 `130 mm`；可用 `--arm-separation` 和 `--letter-spacing` 覆盖。两台机械臂使用各自变换后的标定坐标和供料点，但共用机器人 YAML。正式录屏前应根据远程场景实测调整基座间距。当前方案只允许一台机械臂运动；cuRobo 对活动机械臂做自碰撞、环境、携带方块和已完成字母碰撞检查，另一台机械臂依靠分区和串行策略避让，不宣称做了动态双臂互碰规划。
+
+网页中的“播放 U → S → T 双臂装配”会连续播放全部轨迹；“录制并下载 U-S-T 完整视频”会按所选速度和清晰度导出整段 MP4。
+
 若远程环境仍报错，可在原命令末尾增加 `--debug` 输出完整 traceback。Franka
 配置会在规划时使用 7 个主动臂关节，但插值轨迹可能包含 2 个被锁定的夹爪关节；
 Simulator 会按关节名把 9 维轨迹端点投影回 7 维规划空间，并保留完整轨迹供 Viser
@@ -109,6 +131,9 @@ cube-shadow-sim demo \
 - `curobo_plan.json`：每一段 cuRobo 成功/失败状态和轨迹点数；
 - `curobo_trajectories.npz`：Viser 播放的真实关节轨迹与抓取相对变换。
 - `cube-shadow-<speed>x-<timestamp>.mp4`：网页导出的 30 FPS 完整装配视频。
+- `runs/UST/sequence_manifest.json`：双臂分工、串行顺序、间距、回位状态和三次规划结果；
+- `runs/UST/handoff/{U,S,T}.json`：为组合场景平移后的 Studio 布局副本；
+- `cube-shadow-U-S-T-<speed>x-<timestamp>.mp4`：双臂序列网页导出的完整视频。
 
 故意失败的结构样例：
 

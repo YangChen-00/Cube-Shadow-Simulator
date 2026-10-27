@@ -4,15 +4,24 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
 from .config import WorkcellConfig
 from .layout import Layout
-from .models import ExecutionReport
+from .models import ExecutionReport, Pose
 from .planner import CubeTask, TaskPhase, make_tasks
 from .transforms import cube_pose_in_base, tabletop_point_mm, tool_pose_over_cube
+
+
+@dataclass(frozen=True)
+class StaticCubeObstacle:
+    """A completed cube from an earlier letter in a sequence."""
+
+    name: str
+    pose: Pose
+    side_mm: float
 
 
 @dataclass
@@ -70,9 +79,16 @@ class CuroboPlan:
 class CuroboAssemblyPlanner:
     """Owns one cuRobo planner and its changing collision scene."""
 
-    def __init__(self, layout: Layout, config: WorkcellConfig, warmup: bool = True):
+    def __init__(
+        self,
+        layout: Layout,
+        config: WorkcellConfig,
+        warmup: bool = True,
+        static_cubes: Sequence[StaticCubeObstacle] = (),
+    ):
         self.layout = layout
         self.config = config
+        self.static_cubes = tuple(static_cubes)
         try:
             import torch
             import curobo
@@ -167,8 +183,16 @@ class CuroboAssemblyPlanner:
     def _make_scene(self, Scene, Cuboid):
         side = self.layout.scene.cube_size
         tasks = make_tasks(self.layout, self.config)
-        xs = [p.pose.x for p in self.layout.placements] + [t.source.x for t in tasks]
-        ys = [p.pose.y for p in self.layout.placements] + [t.source.y for t in tasks]
+        xs = (
+            [p.pose.x for p in self.layout.placements]
+            + [t.source.x for t in tasks]
+            + [cube.pose.x for cube in self.static_cubes]
+        )
+        ys = (
+            [p.pose.y for p in self.layout.placements]
+            + [t.source.y for t in tasks]
+            + [cube.pose.y for cube in self.static_cubes]
+        )
         build = self.layout.scene.build_bounds
         if build:
             xs += [build[0], build[1]]
@@ -208,6 +232,14 @@ class CuroboAssemblyPlanner:
                 pose=[*position.tolist(), *quaternion.tolist()],
                 color=[0.90, 0.48, 0.12, 1.0],
             ))
+        for obstacle in self.static_cubes:
+            position, quaternion = cube_pose_in_base(obstacle.pose, self.config)
+            cuboids.append(Cuboid(
+                name=obstacle.name,
+                dims=[obstacle.side_mm / 1000.0] * 3,
+                pose=[*position.tolist(), *quaternion.tolist()],
+                color=[0.32, 0.58, 0.92, 1.0],
+            ))
         return Scene(cuboid=cuboids)
 
     def _goal(self, phase: TaskPhase):
@@ -232,6 +264,19 @@ class CuroboAssemblyPlanner:
         )
         if result is None or result.success is None or not bool(result.success.any().item()):
             return None, [], str(getattr(result, "status", "plan_pose returned no solution"))
+        trajectory = result.get_interpolated_plan()
+        values, trajectory_names = self._trajectory_values(trajectory)
+        self.current_state = self.joint_state_from_waypoint(values[-1], trajectory_names)
+        return values, trajectory_names, "success"
+
+    def _plan_home(self, goal_state):
+        result = self.planner.plan_cspace(
+            goal_state,
+            self.current_state,
+            max_attempts=self.config.max_attempts,
+        )
+        if result is None or result.success is None or not bool(result.success.any().item()):
+            return None, [], str(getattr(result, "status", "plan_cspace returned no solution"))
         trajectory = result.get_interpolated_plan()
         values, trajectory_names = self._trajectory_values(trajectory)
         self.current_state = self.joint_state_from_waypoint(values[-1], trajectory_names)
@@ -339,6 +384,7 @@ class CuroboAssemblyPlanner:
 
     def plan(self) -> CuroboPlan:
         tasks = make_tasks(self.layout, self.config)
+        home_state = self.current_state.clone()
         initial = self.current_state.position.detach().cpu().numpy().reshape(-1)
         phases: List[PlannedPhase] = []
         tool_to_cube: Dict[str, np.ndarray] = {}
@@ -446,6 +492,17 @@ class CuroboAssemblyPlanner:
                 break
             completed += 1
 
+        home_status = None
+        if failure is None:
+            values, trajectory_names, home_status = self._plan_home(home_state)
+            if values is not None:
+                key = "999_home"
+                phases.append(PlannedPhase(
+                    key, "robot", "home", False, values,
+                    trajectory_names, self.config.interpolation_dt,
+                ))
+                counts[key] = int(values.shape[0])
+
         notes = [
             "Approach and pick use cuRoboV2 plan_grasp; lift, transfer, place, and retreat use plan_pose.",
             "Source-table contact is allowed only for a low pick retry and the initial lift; target supports are allowed only during placement.",
@@ -461,6 +518,11 @@ class CuroboAssemblyPlanner:
             notes.append(
                 "Supply-table contact relaxation was required at pick for: "
                 + ", ".join(pick_table_relaxations)
+            )
+        if home_status is not None and home_status != "success":
+            notes.append(
+                "Assembly completed, but cuRobo could not find a collision-free return-home "
+                f"trajectory: {home_status}"
             )
 
         report = ExecutionReport(

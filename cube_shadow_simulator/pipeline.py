@@ -6,12 +6,12 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 
 from .config import WorkcellConfig
-from .curobo_runner import CuroboAssemblyPlanner, CuroboPlan
+from .curobo_runner import CuroboAssemblyPlanner, CuroboPlan, StaticCubeObstacle
 from .feasibility import assess_layout
 from .layout import Layout, load_layout
 from .models import ExecutionReport, FeasibilityReport
@@ -35,9 +35,11 @@ def run_pipeline(
     config_path: str,
     output_dir: str = "runs/latest",
     warmup: bool = True,
+    config_override: Optional[WorkcellConfig] = None,
+    static_cubes: Sequence[StaticCubeObstacle] = (),
 ) -> PipelineResult:
     layout = load_layout(layout_path)
-    config = WorkcellConfig.load(config_path)
+    config = config_override or WorkcellConfig.load(config_path)
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     source_bytes = layout.source_path.read_bytes()
@@ -53,8 +55,15 @@ def run_pipeline(
         "studio_method": layout.method,
         "studio_shadow_metrics": layout.metrics,
         "workcell_config": str(Path(config_path).expanduser().resolve()),
-        "execution_authority": "cuRoboV2 MotionPlanner plan_grasp + plan_pose",
+        "execution_authority": (
+            "cuRoboV2 MotionPlanner plan_grasp + plan_pose + plan_cspace"
+        ),
         "viewer": "cuRobo ViserVisualizer",
+        "static_completed_cubes": len(static_cubes),
+        "effective_tabletop_in_robot_base": {
+            "translation_m": list(config.tabletop_translation_m),
+            "quaternion_wxyz": list(config.tabletop_quaternion_wxyz),
+        },
         "coordinate_contract": (
             "Studio tabletop millimetres transformed by tabletop_in_robot_base; "
             "cuRobo scene uses metres and wxyz quaternions"
@@ -76,7 +85,12 @@ def run_pipeline(
         _write_plan(output, plan)
         return PipelineResult(layout, structural, plan, None, output)
 
-    engine = CuroboAssemblyPlanner(layout, config, warmup=warmup)
+    engine = CuroboAssemblyPlanner(
+        layout,
+        config,
+        warmup=warmup,
+        static_cubes=static_cubes,
+    )
     plan = engine.plan()
     _write_plan(output, plan)
     return PipelineResult(layout, structural, plan, engine, output)
