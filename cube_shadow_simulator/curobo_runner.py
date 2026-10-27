@@ -287,6 +287,7 @@ class CuroboAssemblyPlanner:
         phases: List[PlannedPhase] = []
         tool_to_cube: Dict[str, np.ndarray] = {}
         counts: Dict[str, int] = {}
+        pick_table_relaxations: List[str] = []
         completed = 0
         failure: Optional[tuple[str, str, str]] = None
 
@@ -324,6 +325,26 @@ class CuroboAssemblyPlanner:
                         disable_obstacle(name)
 
                 values, trajectory_names, status = self._plan_phase(phase)
+                if (
+                    values is None
+                    and phase.name == "pick"
+                    and "table" not in disabled_obstacles
+                ):
+                    # Prefer a fully collision-checked grasp. If the Franka
+                    # hand's conservative collision spheres touch the support
+                    # margin at the low grasp pose, retry only this contact
+                    # segment with the supply table allowed. The table stays
+                    # allowed through lift start and is restored after lift.
+                    full_collision_status = status
+                    disable_obstacle("table")
+                    values, trajectory_names, status = self._plan_phase(phase)
+                    if values is not None:
+                        pick_table_relaxations.append(task.cube_id)
+                    else:
+                        status = (
+                            f"full collision check: {full_collision_status}; "
+                            f"supply-table contact retry: {status}"
+                        )
                 if values is None:
                     failure = (task.cube_id, phase.name, status)
                     break
@@ -363,6 +384,18 @@ class CuroboAssemblyPlanner:
                 break
             completed += 1
 
+        notes = [
+            "All robot feasibility claims come from cuRoboV2 plan_pose results.",
+            "Source-table contact is allowed only for a low pick retry and the initial lift; target supports are allowed only during placement.",
+            "A placed cube becomes a collision obstacle immediately after the gripper retreat.",
+            "The carried cube is represented by four conservative attached collision spheres.",
+        ]
+        if pick_table_relaxations:
+            notes.append(
+                "Supply-table contact relaxation was required at pick for: "
+                + ", ".join(pick_table_relaxations)
+            )
+
         report = ExecutionReport(
             success=failure is None,
             completed_steps=completed,
@@ -372,12 +405,7 @@ class CuroboAssemblyPlanner:
             failed_phase=None if failure is None else failure[1],
             failure_status=None if failure is None else failure[2],
             phase_waypoints=counts,
-            notes=[
-                "All robot feasibility claims come from cuRoboV2 plan_pose results.",
-                "Source-table contact is allowed only for the initial lift; target supports are allowed only during placement.",
-                "A placed cube becomes a collision obstacle immediately after the gripper retreat.",
-                "The carried cube is represented by four conservative attached collision spheres.",
-            ],
+            notes=notes,
         )
         return CuroboPlan(
             report=report,
